@@ -1,0 +1,19 @@
+[Unit]
+Description=Refresh ADS-B Exchange and OpenSky owner/operator names in aircraft.sqlite
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=adsb
+Group=adsb
+WorkingDirectory=/opt/adsbfi-proxy
+Environment=PYTHONPATH=/opt/adsbfi-proxy/src
+EnvironmentFile=/etc/adsbfi-proxy/worker.env
+Environment=ADSBFI_AIRCRAFT_CACHE_DIR=/var/cache/adsbfi-proxy/aircraft
+ExecStart=/usr/bin/python3 -m adsbfi_proxy.cli import-aircraft-owners --download
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true

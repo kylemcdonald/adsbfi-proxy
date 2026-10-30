@@ -1,0 +1,18 @@
+[Unit]
+Description=ADS-B flight search API and browser
+After=network-online.target
+
+[Service]
+User=adsb
+Group=adsb
+WorkingDirectory=/opt/adsbfi-proxy
+Environment=PYTHONPATH=/opt/adsbfi-proxy/src
+EnvironmentFile=/etc/adsbfi-proxy/web.env
+ExecStart=/usr/bin/python3 -m adsbfi_proxy.cli serve --host 127.0.0.1 --port 8082
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

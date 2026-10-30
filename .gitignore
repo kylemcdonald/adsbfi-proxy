@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+*.sqlite*
+*.bin.ttf
+*.part
+.env
+*.env
+rust/*/target/
+*.pptx
+/data

@@ -1,0 +1,25 @@
+[Unit]
+Description=ADS-B Exchange download, mirror, and rolling flight builder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=adsb
+Group=adsb
+WorkingDirectory=/opt/adsbfi-proxy
+Environment=PYTHONPATH=/opt/adsbfi-proxy/src
+EnvironmentFile=/etc/adsbfi-proxy/worker.env
+ExecStart=/usr/bin/python3 -m adsbfi_proxy.cli worker
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=600
+KillMode=mixed
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
