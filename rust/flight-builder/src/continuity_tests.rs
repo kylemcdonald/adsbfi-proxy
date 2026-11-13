@@ -110,7 +110,7 @@ impl Fixture {
         let airports = Connection::open(dir.join("airports.sqlite")).unwrap();
         airports.execute_batch("CREATE TABLE airport_types(airport_type_id INTEGER,label TEXT); INSERT INTO airport_types VALUES(1,'large_airport'); CREATE TABLE airports(airport_id INTEGER,lat_e7 INTEGER,lon_e7 INTEGER,elevation_ft INTEGER,airport_type_id INTEGER,name TEXT); INSERT INTO airports VALUES(1,0,0,0,1,'First'),(2,0,150000,0,1,'Separate'),(3,0,2000000,0,1,'Distant');").unwrap();
         let aircraft = Connection::open(dir.join("aircraft.sqlite")).unwrap();
-        aircraft.execute_batch("CREATE TABLE aircraft_types(aircraft_type_id INTEGER,label TEXT); INSERT INTO aircraft_types VALUES(1,'commercial_jet'); CREATE TABLE aircraft(icao_id INTEGER,aircraft_type_id INTEGER,airframe TEXT); INSERT INTO aircraft VALUES(42,1,'L2J');").unwrap();
+        aircraft.execute_batch("CREATE TABLE aircraft_types(aircraft_type_id INTEGER,label TEXT); INSERT INTO aircraft_types VALUES(1,'commercial_jet'); CREATE TABLE aircraft(icao_id INTEGER,aircraft_type_id INTEGER,icao_type TEXT,airframe TEXT); INSERT INTO aircraft VALUES(42,1,'B738','L2J');").unwrap();
         Self { dir }
     }
     fn builder(&self) -> EventBuilder {
@@ -739,7 +739,7 @@ fn v5_bad_early_position_does_not_hide_credible_local_climb() {
 fn v5_physical_airframe_and_operator_class_are_independent() {
     let f = Fixture::new("v5-physical");
     let c = Connection::open(f.dir.join("aircraft.sqlite")).unwrap();
-    c.execute_batch("INSERT INTO aircraft_types VALUES(2,'military'),(3,'piston'); INSERT INTO aircraft VALUES(43,2,'L2T'),(44,3,'L1P'),(45,3,'A1P');").unwrap();
+    c.execute_batch("INSERT INTO aircraft_types VALUES(2,'military'),(3,'piston'); INSERT INTO aircraft(icao_id,aircraft_type_id,airframe) VALUES(43,2,'L2T'),(44,3,'L1P'),(45,3,'A1P');").unwrap();
     let mut b = f.builder();
     assert!(b.transport_aircraft_ids.contains(&43));
     assert_eq!(b.airport_cache_for(false, 44).profile, 1);
@@ -841,7 +841,7 @@ fn v5_float_conversions_retain_water_arrivals_and_airborne_departures() {
     let airports = Connection::open(f.dir.join("airports.sqlite")).unwrap();
     airports.execute_batch("INSERT INTO airport_types VALUES(4,'seaplane_base'); INSERT INTO airports VALUES(4,0,600000,0,4,'Water');").unwrap();
     let aircraft = Connection::open(f.dir.join("aircraft.sqlite")).unwrap();
-    aircraft.execute_batch("INSERT INTO aircraft_types VALUES(2,'piston'); INSERT INTO aircraft VALUES(43,2,'L1P');").unwrap();
+    aircraft.execute_batch("INSERT INTO aircraft_types VALUES(2,'piston'); INSERT INTO aircraft(icao_id,aircraft_type_id,airframe) VALUES(43,2,'L1P');").unwrap();
     let mut b = f.builder();
     let ground = TrackPoint {
         on_ground: true,
@@ -956,7 +956,7 @@ fn v5_weak_climb_toward_water_does_not_select_it_as_the_origin() {
     let airports = Connection::open(f.dir.join("airports.sqlite")).unwrap();
     airports.execute_batch("DELETE FROM airports WHERE airport_id IN (2,3); INSERT INTO airport_types VALUES(4,'seaplane_base'); INSERT INTO airports VALUES(4,0,600000,0,4,'Water');").unwrap();
     let aircraft = Connection::open(f.dir.join("aircraft.sqlite")).unwrap();
-    aircraft.execute_batch("INSERT INTO aircraft_types VALUES(2,'piston'); INSERT INTO aircraft VALUES(43,2,'L1P');").unwrap();
+    aircraft.execute_batch("INSERT INTO aircraft_types VALUES(2,'piston'); INSERT INTO aircraft(icao_id,aircraft_type_id,airframe) VALUES(43,2,'L1P');").unwrap();
     let mut b = f.builder();
     let points = [
         point(10000, 0.035, 1200.0),

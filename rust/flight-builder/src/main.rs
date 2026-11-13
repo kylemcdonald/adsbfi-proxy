@@ -26,6 +26,9 @@ const LEDGER_SCHEMA: &str = "compact-2";
 // transitions-1 onward.
 const STATE_LAYOUT: &str = "transitions-1";
 const MAX_CALLSIGNS: usize = 8;
+// Multi-engine and turbine landplane types that are commonly operated on floats.
+// Other such types never use a seaplane base, which otherwise wins beside a runway.
+const FLOAT_CAPABLE_TYPES: &[&str] = &["DHC6", "C208", "K100", "DH2T", "DH3T", "PC6T", "P750", "AT8T"];
 
 const EVENTS_SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -762,6 +765,7 @@ impl AirportIndex {
                         if excluded.contains(&airport.airport_id)
                             || (profile != 0 && airport.heliport)
                             || (profile == 2 && (airport.water || airport.ultralight))
+                            || (profile == 3 && airport.water)
                         {
                             continue;
                         }
@@ -1025,7 +1029,9 @@ struct EventBuilder {
     all_airports: NearestAirportCache,
     non_heliport_airports: NearestAirportCache,
     land_airports: NearestAirportCache,
+    floatless_airports: NearestAirportCache,
     land_aircraft_ids: HashSet<u32>,
+    floatless_aircraft_ids: HashSet<u32>,
     transport_aircraft_ids: HashSet<u32, FxBuildHasher>,
     has_checkpoint: bool,
     inserted_endpoints: i64,
@@ -1134,13 +1140,26 @@ impl EventBuilder {
         let airport_index = Arc::new(AirportIndex::from_db(airports_db)?);
         let all_airports = NearestAirportCache::new(airport_index.clone(), 12.0, 0);
         let non_heliport_airports = NearestAirportCache::new(airport_index.clone(), 12.0, 1);
-        let land_airports = NearestAirportCache::new(airport_index, 12.0, 2);
+        let land_airports = NearestAirportCache::new(airport_index.clone(), 12.0, 2);
+        let floatless_airports = NearestAirportCache::new(airport_index, 12.0, 3);
         let aircraft =
             Connection::open_with_flags(aircraft_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         let mut query = aircraft.prepare("SELECT a.icao_id FROM aircraft a JOIN aircraft_types t USING(aircraft_type_id) WHERE t.label IN ('commercial_jet','business_jet','unknown_jet','commercial_turboprop')")?;
         let land_aircraft_ids = query
             .query_map([], |r| r.get::<_, u32>(0))?
             .collect::<rusqlite::Result<HashSet<_>>>()?;
+        let mut floatless_aircraft_ids = HashSet::default();
+        let mut floatless = aircraft.prepare("SELECT icao_id, icao_type, airframe FROM aircraft WHERE airframe GLOB 'L[1-8][PTJ]'")?;
+        for row in floatless.query_map([], |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?))
+        })? {
+            let (id, icao_type, airframe) = row?;
+            if (airframe.as_bytes()[1] != b'1' || airframe.as_bytes()[2] != b'P')
+                && !icao_type.is_some_and(|t| FLOAT_CAPABLE_TYPES.contains(&t.as_str()))
+            {
+                floatless_aircraft_ids.insert(id);
+            }
+        }
         let mut transport_aircraft_ids: HashSet<u32, FxBuildHasher> =
             land_aircraft_ids.iter().copied().collect();
         // This import-time index avoids scanning the complete registry per slot.
@@ -1226,7 +1245,9 @@ impl EventBuilder {
             all_airports,
             non_heliport_airports,
             land_airports,
+            floatless_airports,
             land_aircraft_ids,
+            floatless_aircraft_ids,
             transport_aircraft_ids,
             has_checkpoint,
             inserted_endpoints: 0,
@@ -1359,6 +1380,8 @@ impl EventBuilder {
             &mut self.all_airports
         } else if self.land_aircraft_ids.contains(&icao_id) {
             &mut self.land_airports
+        } else if self.floatless_aircraft_ids.contains(&icao_id) {
+            &mut self.floatless_airports
         } else {
             &mut self.non_heliport_airports
         }
@@ -1994,6 +2017,21 @@ impl EventBuilder {
                 best = Some((distance, airport_id, elevation));
             }
         }
+        // An aircraft departs from where it last landed. When that airport also
+        // explains the climb, it outranks a nearer neighbouring major airport.
+        if let Some(anchor) = prior.and_then(|p| p.landing) {
+            if let Some(&(lat, lon, Some(elevation))) = self.airport_locations.get(&anchor.airport_id) {
+                let distance = distance_to(&first, lat, lon);
+                let height = altitude - elevation;
+                if distance <= 40.0
+                    && height <= 10000.0
+                    && height / distance.max(0.1) <= 800.0
+                    && distance_to(&later, lat, lon) >= distance + 0.5
+                {
+                    best = Some((distance, anchor.airport_id, elevation));
+                }
+            }
+        }
         let (_, airport_id, elevation) = best?;
         let location = self.airport_locations.get(&airport_id)?;
         if let Some(previous) = prior.filter(|p| p.landing.is_none()) {
@@ -2194,9 +2232,15 @@ impl EventBuilder {
                         .airport_locations
                         .get(&old.airport_id)
                         .is_some_and(|p| distance_to(&old.point, p.0, p.1) > 1.0);
+                // An aircraft departs from where it landed. A minor-field arrival
+                // followed by a departure from a nearby major airport yields to it.
+                let major_departure = self.airport_locations.get(&departure.airport_id).is_some_and(|p| {
+                    self.major_airports.near(p.0, p.1, 0.1).any(|m| m.0 == departure.airport_id)
+                });
                 if previous.episode == pending.episode
                     && departure.airport_id != old.airport_id
-                    && weak_touchdown
+                    && (weak_touchdown
+                        || (major_departure && self.small_airport_ids.contains(&old.airport_id)))
                     && self
                         .airport_locations
                         .get(&departure.airport_id)
@@ -2204,8 +2248,25 @@ impl EventBuilder {
                 {
                     let mut approach = previous.clone();
                     approach.landing = None;
+                    // Retained context can be too short to show the descent; closing
+                    // on the departure airport then suffices for the reassignment.
+                    let closing = self.airport_locations.get(&departure.airport_id).and_then(|p| {
+                        let mut points = previous.points.iter().filter(|q| !q.on_ground);
+                        let last = points.clone().max_by_key(|q| q.ts)?;
+                        points
+                            .any(|q| {
+                                last.ts - q.ts >= 30
+                                    && distance_to(q, p.0, p.1) > distance_to(last, p.0, p.1) + 0.5
+                            })
+                            .then_some(EndpointCandidate {
+                                airport_id: departure.airport_id,
+                                airport_elevation_ft: p.2,
+                                ..old
+                            })
+                    });
                     corrected = self
                         .corroborated_arrival(&approach, departure)
+                        .or(closing)
                         .map(|a| self.timed_arrival(state.icao_id, a, departure.ts));
                 }
             }
@@ -2298,13 +2359,15 @@ impl EventBuilder {
                         }
                     }
                     // Resolve an adjacent-airport origin ambiguity using this aircraft's previous
-                    // arrival. The airport identities remain separate; no alias table.
+                    // arrival. The airport identities remain separate; no alias table. An
+                    // aircraft departs from where it landed, so an origin seen only airborne
+                    // also yields to the arrival airport across a wider neighbourhood.
                     if let Some(anchor) = previous.landing {
                         if let (Some(a), Some(b)) = (
                             self.airport_locations.get(&anchor.airport_id),
                             self.airport_locations.get(&departure.airport_id),
                         ) {
-                            let near_airports = distance_to(
+                            let separation = distance_to(
                                 &TrackPoint {
                                     ts: 0,
                                     lat: a.0,
@@ -2314,12 +2377,22 @@ impl EventBuilder {
                                 },
                                 b.0,
                                 b.1,
-                            ) <= 4.0;
+                            );
+                            // A major-airport origin outranks a minor-field arrival: there the
+                            // arrival, not the departure, is the likely misassignment.
+                            let major = |id: i64, p: &(f64, f64, Option<f64>)| {
+                                self.major_airports.near(p.0, p.1, 0.1).any(|m| m.0 == id)
+                            };
+                            let near_airports = separation <= 4.0
+                                || (separation <= 15.0
+                                    && !departure.point.on_ground
+                                    && (major(anchor.airport_id, a) || !major(departure.airport_id, b)));
                             if departure.airport_id != anchor.airport_id
                                 && near_airports
                                 && state.segment_start_ts > previous.end_ts
                                 && state.segment_start_ts - previous.end_ts <= 48 * 3600
-                                && distance_to(&departure.point, a.0, a.1) <= 6.0
+                                && distance_to(&departure.point, a.0, a.1)
+                                    <= if separation <= 4.0 { 6.0 } else { 12.0 }
                             {
                                 takeoff = Some(EndpointCandidate {
                                     airport_id: anchor.airport_id,
@@ -3888,6 +3961,7 @@ mod endpoint_tests {
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 0).unwrap().airport_id, 1); // rotorcraft
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 1).unwrap().airport_id, 2); // amphibious/unknown fixed wing retains water candidate
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 2).unwrap().airport_id, 3); // known jets
+        assert_eq!(i.nearest(0.0, 0.0, 12.0, 3).unwrap().airport_id, 3); // twins and turbine landplanes
     }
     #[test]
     fn small_airports_are_not_blanket_excluded() {
