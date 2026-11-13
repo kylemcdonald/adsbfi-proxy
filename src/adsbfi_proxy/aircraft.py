@@ -95,10 +95,11 @@ AIRLINER_PATTERNS = (
 )
 
 BUSINESS_AIRLINER_DERIVATIVE_PATTERNS = (
-    r"\bBBJ\b",
+    r"\bBBJ[0-9]*\b",
     r"\bBOEING\s?BUSINESS\s?JET\b",
-    r"\bACJ\b",
+    r"\bACJ(?:\s?[0-9]{3}[A-Z0-9]*)?\b",
     r"\bAIRBUS\s?CORPORATE\s?JET\b",
+    r"\bLINEAGE\b",
 )
 
 BUSINESS_JET_PATTERNS = (
@@ -152,7 +153,7 @@ TURBOPROP_AIRLINER_PATTERNS = (
 
 TURBOPROP_TEXT_PATTERNS = (
     r"\bKING\s?AIR\b",
-    r"\b(?:BEECH|BEECHCRAFT|TEXTRON|HAWKER)\b.*\bB(?:200|300|350)[A-Z]*\b",
+    r"\b(?:BEECH|BEECHCRAFT|TEXTRON|HAWKER|RAYTHEON)\b.*\bB(?:200|300|350)[A-Z]*\b",
     r"\bPC\s?12\b",
     r"\bTBM\s?(?:7|8|9)[0-9]{2}\b",
     r"\bCARAVAN\b(?!\s?CO\b)",
@@ -183,7 +184,7 @@ PISTON_PATTERNS = (
     r"\bPIPER\b.*\b(?:PA\s?)?(?:28|31|32)\b",
     r"\bSR\s?(?:20|22)[A-Z]*\b",
     r"\bCIRRUS\b.*\bSR\s?(?:20|22)[A-Z]*\b",
-    r"\bBEECH\b.*\b(?:A36|B36|G36|G58|95\s?B55|B55)\b",
+    r"\bBEECH(?:CRAFT)?\b.*\b(?:A36|B36|G36|G58|95\s?B55|B55)\b",
     r"\bBE(?:35|36|55|58)\b|\bBARON\b|\bBONANZA\b",
     r"\bAA\s?5[AB]?\b",
     r"\bRV\s?(?:3|4|6|7|8|9|10|12|14)[A-Z]*\b",
@@ -337,6 +338,10 @@ def classify_aircraft(
         normalize_match_text(model),
     ):
         return "piston"
+    # FAA reciprocating engine codes outrank text: manufacturer names such as
+    # Hawker Beechcraft otherwise match business-jet patterns.
+    if type_engine_code in {"1", "01", "7", "8", "11"}:
+        return "piston"
     if matches_any(text, TURBOPROP_AIRLINER_PATTERNS):
         return "commercial_turboprop"
     if type_engine_code == "2" or "T" in short:
@@ -355,8 +360,6 @@ def classify_aircraft(
         if seat_count is not None or weight_class is not None:
             return "business_jet"
         return "unknown_jet"
-    if type_engine_code in {"1", "01", "7", "8", "11"}:
-        return "piston"
     if type_engine_code == "10":
         return "electric"
     if type_aircraft_code in {"4", "5"}:

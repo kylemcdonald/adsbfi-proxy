@@ -33,6 +33,21 @@ class AircraftClassificationTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertEqual(classify_aircraft(manufacturer=manufacturer, model=model, icao_type=icao), expected)
 
+    def test_reported_classification_errors(self):
+        # IPS-Inequality/pjet#3: corporate airliner variants, manufacturer
+        # names matching model patterns, and FAA engine codes overridden.
+        for kwargs, expected in [
+            (dict(manufacturer='YABORA INDUSTRIA AERONAUTICA S', model='ERJ 170-200 LR', icao_type='E75L'), 'commercial_jet'),
+            (dict(manufacturer='EMBRAER-EMPRESA BRASILEIRA DE', model='ERJ 190-100 IGW', icao_type='E190'), 'commercial_jet'),
+            (dict(manufacturer='AIRBUS', model='ACJ319 115X', icao_type='A319'), 'business_jet'),
+            (dict(manufacturer='EMBRAER', model='Lineage 1000', icao_type='E190'), 'business_jet'),
+            (dict(manufacturer='CESSNA', model='680A', icao_type='C68A'), 'business_jet'),
+            (dict(manufacturer='HAWKER BEECHCRAFT CORP', model='G58'), 'piston'),
+            (dict(manufacturer='RAYTHEON AIRCRAFT COMPANY', model='B300'), 'turboprop'),
+        ]:
+            with self.subTest(**kwargs):
+                self.assertEqual(classify_aircraft(**kwargs), expected)
+
     def test_piston_and_rotorcraft_remain_distinct(self):
         for manufacturer, model, expected in [
             ('CESSNA', '170', 'piston'), ('CESSNA', '172 SKYHAWK', 'piston'),
