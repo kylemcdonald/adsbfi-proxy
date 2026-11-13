@@ -1,12 +1,13 @@
 [project]
 name = "adsbfi-proxy"
 version = "0.1.0"
-description = "Rolling ADS-B Exchange heatmap mirror and SQLite flight database"
+description = "Rolling adsb.fi heatmap mirror and SQLite takeoff/landing ledger"
 requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
 imports = ["numpy>=1.26"]
+evaluation = ["timezonefinder>=6.5"]
 
 [project.scripts]
 adsbfi-proxy = "adsbfi_proxy.cli:main"
