@@ -1,14 +1,14 @@
-Current inference: [endpoint v5](ENDPOINT_V5.md), including physical-airframe evidence, preserved climb samples, generalized arrival confirmation and position-quality checks. Production workers run v5 against a compact ledger with callsigns, replayed from the full mirror; rebuild into fresh databases before changing inference or the ledger schema.
+Current inference: [endpoint v6](ENDPOINT_V6.md): liftoff/touchdown timing, climb-out departures and airport continuity, validated against BTS airline flights. It builds on [v5](ENDPOINT_V5.md). Rebuild into fresh databases before changing inference or the ledger schema.
 
 # adsbfi-proxy
 
 A rolling SQLite ledger of independently inferred takeoffs and landings from
-ADS-B Exchange heatmaps, with an optional archive mirror and movement browser.
+[adsb.fi](https://adsb.fi) heatmaps, with an optional archive mirror and movement browser.
 
-**Endpoint v5 requires fresh event and checkpoint databases.** Re-import aircraft
+**Endpoint v6 requires fresh event and checkpoint databases.** Re-import aircraft
 references to populate physical airframe descriptors and the packed inference
-index. Do not point the new builder at an existing v1/v2/v3/v4 installation.
-See [inference, timing and validation](ENDPOINT_V5.md).
+index. Do not point the new builder at an existing v1–v5 installation.
+See [inference, timing and validation](ENDPOINT_V6.md).
 
 ## Run
 
@@ -85,13 +85,17 @@ intervals, so polling every minute does not imply minute-resolution publication.
 It allows two minutes after a slot closes for publication and retries a missing
 recent slot each minute. Only complete files enter flight inference.
 
-ADS-B Exchange began requiring a browser Turnstile session for `globe_history`
-in October 2026. The worker therefore tries `ADSBFI_BASE_URL` first and falls
-back to the public, format-compatible `ADSBFI_FALLBACK_URL`
-(`https://globe.adsb.fi/globe_history` by default) on 403/404 or a network
-error. Set `ADSBFI_FALLBACK_URL=` to disable the mirror, or point it at another
-readsb `globe_history` instance. `proxy-status.json` records
-`last_download_source` as `adsbx` or `adsbfi`.
+Files come from `ADSBFI_BASE_URL` (`https://globe.adsb.fi/globe_history` by
+default) at the upstream readsb layout `YYYY/MM/DD/heatmap/NN.bin.ttf`, where
+`NN` is the half-hour slot of the UTC day. The cache uses the same layout.
+`ADSBFI_FALLBACK_URL` optionally names a second readsb `globe_history`
+instance, tried on 403/404 or a network error. `proxy-status.json` records
+`last_download_source` as `primary` or `fallback`.
+
+`ADSBFI_ARCHIVE_DIR` optionally points at an existing read-only copy of the
+same layout, such as a bulk download. A slot found there satisfies downloads,
+audits and builds without being copied into the cache, and live cleanup never
+deletes from it. The worker continues without it when it is not mounted.
 
 - `live` mode downloads new slots, builds endpoints in chronological order, and
   deletes raw files only after a successful durable checkpoint. It retries gaps
@@ -209,7 +213,7 @@ endpoints.
 
 The new builder does not produce paired flights or support old consumer schemas.
 `/api/flights` returns 410 on an endpoint-only database. Historical v1 read helpers remain
-available for comparison; they are not part of the v5 ingestion path.
+available for comparison; they are not part of the endpoint ingestion path.
 
 ## Services and checks
 
@@ -232,6 +236,11 @@ cargo build --release --manifest-path rust/flight-builder/Cargo.toml
 ADSBFI_TEST_BUILDER="$CARGO_TARGET_DIR/release/flight-builder" PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-Data sources include ADS-B Exchange, OurAirports, FAA, tar1090/Mictronics, and
-optionally OpenSky. Source datasets are not bundled with the application.
+Before changing inference, replay a fresh ledger with `benchmarks/replay.sh` and
+compare `benchmarks/bts_eval.py` (BTS airline ground truth) and
+`benchmarks/continuity.py` (landing→takeoff airport agreement for all aircraft)
+against the previous version, as described in [ENDPOINT_V6.md](ENDPOINT_V6.md).
+
+Data sources include adsb.fi, OurAirports, FAA, tar1090/Mictronics, the ADS-B
+Exchange basic aircraft database, and optionally OpenSky. Source datasets are not bundled with the application.
 Generated data, credentials, caches, and machine-specific settings stay untracked.

@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>adsbfi-proxy · Flights</title><link rel="stylesheet" href="style.css"></head>
 <body><main><header><span class="wordmark">adsbfi-proxy</span><span id="status">Loading database status…</span></header>
-<h1>Flight history</h1><p>Search inferred takeoff and landing pairs from ADS-B Exchange. Click a flight to view its path.</p>
+<h1>Flight history</h1><p>Search inferred takeoff and landing pairs from adsb.fi. Click a flight to view its path.</p>
 <form id="search"><label>Airport<input name="airport" placeholder="KJFK, EGLL…" list="airports" autocomplete="off"><datalist id="airports"></datalist></label><label>Registration / ICAO<input name="aircraft" placeholder="N123AB or a01234"></label><label>Owner<input name="owner" placeholder="Name contains…"></label><label>From (UTC)<input type="date" name="start"></label><label>Through (UTC)<input type="date" name="end"></label><button>Search flights</button></form>
 <div class="results-heading"><span id="message" role="status" aria-live="polite"></span><button id="more" hidden>Load more</button></div>
 <div class="table-wrap"><table><thead><tr><th>Aircraft</th><th>Owner</th><th>Departure (UTC)</th><th>From</th><th>Arrival (UTC)</th><th>To</th><th>Duration</th></tr></thead><tbody id="results"></tbody></table></div>
