@@ -199,6 +199,8 @@ fn flight() -> TrackState {
         source_last_file: None,
         open_start: false,
         callsigns: Vec::new(),
+        liftoff: None,
+        touchdown: None,
     }
 }
 #[test]
@@ -278,7 +280,10 @@ fn committed_events_survive_replay_from_old_context_checkpoint_without_duplicate
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .unwrap();
-        assert_eq!(r, (1, 10000, 1000, 10000));
+        // The stored time extrapolates the 4,000 ft corroborating report
+        // back to liftoff at the transport climb rate; the bounds keep the
+        // observation interval.
+        assert_eq!(r, (1, 9909, 1000, 10000));
         assert_eq!(
             b.events_conn
                 .query_row(
@@ -549,8 +554,9 @@ fn tentative_small_airport_landing_survives_restart_and_uses_supported_destinati
         s.last_points = vec![point(18000, 1.0, 20000.0)];
         b.finalise_segment(&s, None).unwrap();
         b.save_state().unwrap();
-        let row:(i64,i64,i64,String)=b.events_conn.query_row("SELECT airport_id,time_start_ts,time_end_ts,evidence FROM endpoint_audit WHERE kind='landing'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
-        assert_eq!(row, (3, 12000, 16000, "arrival_destination_context".into()));
+        let row:(i64,i64,i64,i64,String)=b.events_conn.query_row("SELECT airport_id,ts,time_start_ts,time_end_ts,evidence FROM endpoint_audit WHERE kind='landing'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        // The corrected arrival is timed by the remaining approach distance.
+        assert_eq!(row, (3, 12123, 12000, 16000, "arrival_destination_context".into()));
         assert!(b.pending_landings.is_empty());
     }
 }

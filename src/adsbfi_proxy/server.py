@@ -228,7 +228,7 @@ def serve(config, host, port):
                     name, kind = {'/': ('index.html', 'text/html; charset=utf-8'), '/app.js': ('app.js', 'text/javascript'), '/style.css': ('style.css', 'text/css')}[path.path]
                     if path.path == '/':
                         with closing(connect(config)) as db:
-                            if db.execute("SELECT value FROM meta WHERE key='inference_version' AND value IN ('endpoints-v2','endpoints-v3','endpoints-v4','endpoints-v5')").fetchone(): name = 'endpoints.html'
+                            if db.execute("SELECT value FROM meta WHERE key='inference_version' AND value IN ('endpoints-v2','endpoints-v3','endpoints-v4','endpoints-v5','endpoints-v6')").fetchone(): name = 'endpoints.html'
                     self.send(200, (ROOT / 'web' / name).read_bytes(), kind)
                 else:
                     self.send(404, {'error': 'Not found'})

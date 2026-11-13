@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_aircraft_time ON endpoints(icao_id,ts,is_landing);
 CREATE INDEX IF NOT EXISTS idx_endpoints_airport_time ON endpoints(airport_id,ts,icao_id,is_landing);
 
-INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v5');
+INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v6');
 INSERT OR IGNORE INTO meta(key,value) VALUES('ledger_schema','compact-2');
 """
 
@@ -127,14 +127,15 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_slot ON processed_files(slot_ts);
 
 CREATE TABLE IF NOT EXISTS pending_landings (
     icao_id INTEGER PRIMARY KEY, episode INTEGER NOT NULL, airport_id INTEGER NOT NULL,
-    elevation REAL, confidence REAL NOT NULL, point BLOB NOT NULL, callsign INTEGER
+    elevation REAL, confidence REAL NOT NULL, point BLOB NOT NULL, callsign INTEGER,
+    ts INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS recent_flights (
     icao_id INTEGER PRIMARY KEY, episode_start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
     max_altitude_ft REAL NOT NULL, points BLOB NOT NULL,
     airport_id INTEGER, elevation_ft REAL, confidence REAL, anchor_point BLOB NOT NULL,
-    callsign INTEGER
+    callsign INTEGER, anchor_ts INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_recent_flights_end ON recent_flights(end_ts);
 
@@ -152,11 +153,13 @@ CREATE TABLE IF NOT EXISTS track_states (
     source_first_file TEXT,
     source_last_file TEXT,
     open_start INTEGER NOT NULL,
-    callsigns BLOB NOT NULL
+    callsigns BLOB NOT NULL,
+    liftoff BLOB,
+    touchdown BLOB
 );
 
-INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v5');
-INSERT OR IGNORE INTO meta(key,value) VALUES('state_layout','callsigns-1');
+INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v6');
+INSERT OR IGNORE INTO meta(key,value) VALUES('state_layout','transitions-1');
 """
 
 

@@ -17,12 +17,14 @@ const SLICE_BEGIN_MARKER: i32 = 0x0e7f7c9d;
 const MAX_ICAO_ID: u32 = 0x00ff_ffff;
 const EARTH_RADIUS_KM: f64 = 6371.0088;
 
-const INFERENCE_VERSION: &str = "endpoints-v5";
+const INFERENCE_VERSION: &str = "endpoints-v6";
 // Only the columns readers and replay deduplication need are stored.
 // compact-2 adds a dictionary-encoded callsign to each endpoint.
 const LEDGER_SCHEMA: &str = "compact-2";
-// Checkpoints carry per-track callsign tallies from callsigns-1 onward.
-const STATE_LAYOUT: &str = "callsigns-1";
+// Checkpoints carry per-track callsign tallies from callsigns-1 onward, and
+// the liftoff/touchdown transitions and estimated movement times from
+// transitions-1 onward.
+const STATE_LAYOUT: &str = "transitions-1";
 const MAX_CALLSIGNS: usize = 8;
 
 const EVENTS_SCHEMA: &str = r#"
@@ -71,13 +73,14 @@ CREATE INDEX IF NOT EXISTS idx_processed_files_slot ON processed_files(slot_ts);
 
 CREATE TABLE IF NOT EXISTS pending_landings (
     icao_id INTEGER PRIMARY KEY, episode INTEGER NOT NULL, airport_id INTEGER NOT NULL,
-    elevation REAL, confidence REAL NOT NULL, point BLOB NOT NULL, callsign INTEGER
+    elevation REAL, confidence REAL NOT NULL, point BLOB NOT NULL, callsign INTEGER,
+    ts INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS recent_flights (
     icao_id INTEGER PRIMARY KEY, episode_start_ts INTEGER NOT NULL, end_ts INTEGER NOT NULL,
     max_altitude_ft REAL NOT NULL, points BLOB NOT NULL,
     airport_id INTEGER, elevation_ft REAL, confidence REAL, anchor_point BLOB NOT NULL,
-    callsign INTEGER
+    callsign INTEGER, anchor_ts INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_recent_flights_end ON recent_flights(end_ts);
 
@@ -95,7 +98,9 @@ CREATE TABLE IF NOT EXISTS track_states (
     source_first_file TEXT,
     source_last_file TEXT,
     open_start INTEGER NOT NULL,
-    callsigns BLOB NOT NULL
+    callsigns BLOB NOT NULL,
+    liftoff BLOB,
+    touchdown BLOB
 );
 
 "#;
@@ -107,6 +112,32 @@ struct TrackPoint {
     lon: f64,
     alt_ft: Option<f64>,
     on_ground: bool,
+}
+
+// Consecutive reports where the ground flag changes. `air` is the first
+// airborne report after liftoff or the last before touchdown; `ground` is the
+// adjacent ground report when one was received. Without ground coverage a
+// liftoff is the first airborne report and a touchdown the last.
+#[derive(Clone, Copy, Debug)]
+struct Transition {
+    air: TrackPoint,
+    ground: Option<TrackPoint>,
+}
+
+impl Transition {
+    fn blob(transition: Option<Transition>) -> Option<Vec<u8>> {
+        transition.map(|t| points_blob(&[Some(t.air), t.ground].into_iter().flatten().collect::<Vec<_>>()))
+    }
+
+    fn parse(bytes: Option<Vec<u8>>) -> rusqlite::Result<Option<Transition>> {
+        let Some(bytes) = bytes else { return Ok(None) };
+        let points = parse_points_blob(&bytes)?;
+        match points.as_slice() {
+            [air] => Ok(Some(Transition { air: *air, ground: None })),
+            [air, ground] => Ok(Some(Transition { air: *air, ground: Some(*ground) })),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    }
 }
 
 // A validated identification: trimmed ASCII, zero-padded, packed little endian.
@@ -146,6 +177,8 @@ struct AircraftFileSummary {
     point_count: i64,
     first_terminal: Option<TrackPoint>,
     last_terminal: Option<TrackPoint>,
+    liftoff: Option<Transition>,
+    touchdown: Option<Transition>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +203,11 @@ struct SummaryBuilder {
     point_count: i64,
     first_terminal: Option<TrackPoint>,
     last_terminal: Option<TrackPoint>,
+    // The latest liftoff, and the latest airborne report with the ground
+    // report that immediately followed it.
+    liftoff: Option<Transition>,
+    last_air: Option<TrackPoint>,
+    touchdown_ground: Option<TrackPoint>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -184,7 +222,21 @@ struct RawPoint {
 
 impl SummaryBuilder {
     fn new(ts: i64, lat: f64, lon: f64, alt_ft: Option<f64>, on_ground: bool) -> Self {
+        let first = TrackPoint {
+            ts,
+            lat,
+            lon,
+            alt_ft,
+            on_ground,
+        };
+        let airborne = !on_ground && alt_ft.is_some();
         Self {
+            liftoff: airborne.then_some(Transition {
+                air: first,
+                ground: None,
+            }),
+            last_air: airborne.then_some(first),
+            touchdown_ground: None,
             departure_extra: None,
             frozen_pair: None,
             early: None,
@@ -270,6 +322,29 @@ impl SummaryBuilder {
             alt_ft,
             on_ground,
         };
+        if !on_ground && alt_ft.is_some() {
+            if self.last_on_ground {
+                self.liftoff = Some(Transition {
+                    air: point,
+                    ground: Some(TrackPoint {
+                        ts: self.last_ts,
+                        lat: self.last_lat,
+                        lon: self.last_lon,
+                        alt_ft: self.last_alt_ft,
+                        on_ground: true,
+                    }),
+                });
+            } else if self.liftoff.is_none() {
+                self.liftoff = Some(Transition {
+                    air: point,
+                    ground: None,
+                });
+            }
+            self.last_air = Some(point);
+            self.touchdown_ground = None;
+        } else if on_ground && !self.last_on_ground && self.last_alt_ft.is_some() {
+            self.touchdown_ground = Some(point);
+        }
         if (self.first_on_ground || self.first_alt_ft.is_none()) && !on_ground && alt_ft.is_some() {
             let extra = self
                 .departure_extra
@@ -359,6 +434,11 @@ impl SummaryBuilder {
             point_count: self.point_count,
             first_terminal: self.first_terminal,
             last_terminal: self.last_terminal,
+            liftoff: self.liftoff,
+            touchdown: self.last_air.map(|air| Transition {
+                air,
+                ground: self.touchdown_ground,
+            }),
         }
     }
 }
@@ -379,6 +459,11 @@ struct TrackState {
     source_last_file: Option<String>,
     open_start: bool,
     callsigns: Vec<CallsignSpan>,
+    // The latest liftoff before the highest report, and the latest
+    // touchdown, used to time the movements more closely than the evidence
+    // points that select their airports.
+    liftoff: Option<Transition>,
+    touchdown: Option<Transition>,
 }
 
 impl TrackState {
@@ -402,6 +487,26 @@ impl TrackState {
             alt_ft: summary.last_alt_ft,
             on_ground: summary.last_on_ground,
         };
+
+        // A ground/air change can fall between two files.
+        let previous = self.last_points.last().copied();
+        let mut liftoff = summary.liftoff;
+        if let (Some(l), Some(p)) = (liftoff.as_mut(), previous) {
+            if l.ground.is_none() && l.air.ts == summary.first_ts && p.on_ground {
+                l.ground = Some(p);
+            }
+        }
+        if let Some(p) = previous.filter(|p| !p.on_ground && p.alt_ft.is_some()) {
+            if summary.first_on_ground {
+                self.touchdown = Some(Transition {
+                    air: p,
+                    ground: Some(first_point),
+                });
+            }
+        }
+        if summary.touchdown.is_some() {
+            self.touchdown = summary.touchdown;
+        }
 
         self.segment_end_ts = summary.last_ts;
         self.last_seen_ts = summary.last_ts;
@@ -498,6 +603,15 @@ impl TrackState {
                 self.max_altitude_ts = summary.max_altitude_ts;
             }
         }
+        // Without a ground report, only the track's first airborne report
+        // marks a liftoff: later files simply begin mid-flight.
+        if let Some(l) = liftoff {
+            if (l.ground.is_some() || self.liftoff.is_none())
+                && self.max_altitude_ts.is_some_and(|ts| l.air.ts <= ts)
+            {
+                self.liftoff = Some(l);
+            }
+        }
     }
 
     fn row_tuple(
@@ -517,6 +631,8 @@ impl TrackState {
         Option<String>,
         i64,
         Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
     ) {
         (
             self.icao_id as i64,
@@ -533,6 +649,8 @@ impl TrackState {
             self.source_last_file.clone(),
             self.open_start as i64,
             callsigns_blob(&self.callsigns),
+            Transition::blob(self.liftoff),
+            Transition::blob(self.touchdown),
         )
     }
 }
@@ -864,6 +982,26 @@ fn distance_to(point: &TrackPoint, lat: f64, lon: f64) -> f64 {
     111.195 * (dx * dx + dy * dy).sqrt()
 }
 
+// Large and medium airports on a half-degree grid, for climb-out searches
+// wider than the endpoint match radius.
+struct MajorAirports {
+    grid: HashMap<(i32, i32), Vec<(i64, f64, f64, f64)>>,
+}
+
+impl MajorAirports {
+    const CELL: f64 = 0.5;
+
+    fn near(&self, lat: f64, lon: f64, radius_km: f64) -> impl Iterator<Item = &(i64, f64, f64, f64)> {
+        let dlat = (radius_km / 111.0 / Self::CELL).ceil() as i32;
+        let dlon = (radius_km / (111.0 * lat.to_radians().cos().max(0.15)) / Self::CELL).ceil() as i32;
+        let (cy, cx) = cell_for(Self::CELL, lat, lon);
+        (cy - dlat..=cy + dlat)
+            .flat_map(move |y| (cx - dlon..=cx + dlon).map(move |x| (y, x)))
+            .filter_map(|key| self.grid.get(&key))
+            .flatten()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingLanding {
     episode: i64,
@@ -880,6 +1018,7 @@ struct EventBuilder {
     observed_through: i64,
     airport_locations: HashMap<i64, (f64, f64, Option<f64>)>,
     large_airport_ids: HashSet<i64>,
+    major_airports: MajorAirports,
     events_conn: Connection,
     state_conn: Connection,
     rotorcraft_ids: HashSet<u32>,
@@ -943,7 +1082,7 @@ impl EventBuilder {
             || version.as_deref().is_some_and(|v| v != INFERENCE_VERSION)
         {
             return Err(anyhow!(
-                "Use fresh events/state databases for endpoints-v5; rebuild separately before switching readers"
+                "Use fresh events/state databases for endpoints-v6; rebuild separately before switching readers"
             ));
         }
         let ledger: Option<String> = events_conn
@@ -1039,10 +1178,17 @@ impl EventBuilder {
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
         let large_airport_ids = refs.prepare("SELECT airport_id FROM airports JOIN airport_types USING(airport_type_id) WHERE label='large_airport'")?
             .query_map([],|r|r.get(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
+        let mut major_airports = MajorAirports { grid: HashMap::default() };
+        for row in refs.prepare("SELECT airport_id,lat_e7/1e7,lon_e7/1e7,elevation_ft FROM airports JOIN airport_types USING(airport_type_id) WHERE label IN ('large_airport','medium_airport') AND elevation_ft IS NOT NULL")?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, f64>(3)?)))?
+        {
+            let airport = row?;
+            major_airports.grid.entry(cell_for(MajorAirports::CELL, airport.1, airport.2)).or_default().push(airport);
+        }
         let small_airport_ids = refs.prepare("SELECT airport_id FROM airports JOIN airport_types USING(airport_type_id) WHERE label='small_airport'")?
             .query_map([],|r|r.get(0))?.collect::<rusqlite::Result<HashSet<_>>>()?;
         let pending_landings = {
-            let mut q=state_conn.prepare("SELECT icao_id,episode,airport_id,elevation,confidence,point,callsign FROM pending_landings")?;
+            let mut q=state_conn.prepare("SELECT icao_id,episode,airport_id,elevation,confidence,point,callsign,ts FROM pending_landings")?;
             q.query_map([], |r| {
                 let point = *parse_points_blob(&r.get::<_, Vec<u8>>(5)?)?
                     .first()
@@ -1052,7 +1198,7 @@ impl EventBuilder {
                     PendingLanding {
                         episode: r.get(1)?,
                         endpoint: EndpointCandidate {
-                            ts: point.ts,
+                            ts: r.get(7)?,
                             airport_id: r.get(2)?,
                             airport_elevation_ft: r.get(3)?,
                             confidence: r.get(4)?,
@@ -1073,6 +1219,7 @@ impl EventBuilder {
             observed_through: 0,
             airport_locations,
             large_airport_ids,
+            major_airports,
             events_conn,
             state_conn,
             rotorcraft_ids,
@@ -1167,7 +1314,8 @@ impl EventBuilder {
             r#"
             SELECT icao_id, is_rotorcraft, segment_start_ts, segment_end_ts, last_seen_ts,
                    first_points, last_points, point_count, max_altitude_ft,
-                   max_altitude_ts, source_first_file, source_last_file, open_start, callsigns
+                   max_altitude_ts, source_first_file, source_last_file, open_start, callsigns,
+                   liftoff, touchdown
             FROM track_states
             ORDER BY rowid
             "#,
@@ -1191,6 +1339,8 @@ impl EventBuilder {
                     source_last_file: row.get(11)?,
                     open_start: row.get::<_, i64>(12)? != 0,
                     callsigns: parse_callsigns_blob(&row.get::<_, Vec<u8>>(13)?)?,
+                    liftoff: Transition::parse(row.get(14)?)?,
+                    touchdown: Transition::parse(row.get(15)?)?,
                 },
             ))
         })?;
@@ -1505,15 +1655,106 @@ impl EventBuilder {
         }
     }
 
+    // Climb rate (ft/min), approach speed (km/h) and descent rate (ft/min)
+    // for extrapolating a movement time from the nearest airborne report.
+    // The transport values were fitted to BTS wheels-off/on times; the others
+    // are conservative physical defaults that the BTS ground truth cannot check.
+    fn movement_rates(&self, icao_id: u32, is_rotorcraft: bool) -> (f64, f64, f64) {
+        if is_rotorcraft {
+            (1000.0, 120.0, 500.0)
+        } else if self.transport_aircraft_ids.contains(&icao_id) {
+            (2500.0, 250.0, 1000.0)
+        } else {
+            (800.0, 150.0, 500.0)
+        }
+    }
+
+    // The evidence point selects the airport; the time comes from the
+    // liftoff. Ground reports during taxi otherwise date a departure minutes
+    // early, and the first airborne report seen high above the field late.
+    fn takeoff_time(&self, state: &TrackState, candidate: &EndpointCandidate) -> i64 {
+        let Some(liftoff) = state.liftoff else {
+            return candidate.ts;
+        };
+        let air = liftoff.air;
+        // A liftoff from the selected airport's ground stays valid after any
+        // time parked there; continuous gate reports do not end a track.
+        let from_airport = liftoff.ground.is_some_and(|g| {
+            candidate.point.on_ground
+                && self
+                    .airport_locations
+                    .get(&candidate.airport_id)
+                    .is_some_and(|a| distance_to(&g, a.0, a.1) <= 5.0)
+        });
+        if air.ts < candidate.ts - 15 * 60 || air.ts > candidate.ts + 45 * 60 && !from_airport {
+            return candidate.ts;
+        }
+        let ts = self.climb_start(state.icao_id, state.is_rotorcraft, &air, candidate.airport_elevation_ft);
+        liftoff.ground.map_or(ts, |g| ts.max(g.ts))
+    }
+
+    // Liftoff time of a climb first received at `air`: its height above the
+    // field at the class climb rate, at most ten minutes back.
+    fn climb_start(&self, icao_id: u32, is_rotorcraft: bool, air: &TrackPoint, elevation_ft: Option<f64>) -> i64 {
+        let (climb_fpm, ..) = self.movement_rates(icao_id, is_rotorcraft);
+        let height = air.alt_ft.zip(elevation_ft).map_or(0.0, |(a, e)| a - e);
+        let seconds = ((height - 200.0).max(0.0) / climb_fpm * 60.0).min(600.0);
+        air.ts - seconds.round() as i64
+    }
+
+    // Touchdown time of an approach last received at `air`: the longer of
+    // its distance from the field at approach speed and its height at the
+    // descent rate, at most twenty minutes on.
+    fn approach_end(&self, icao_id: u32, is_rotorcraft: bool, air: &TrackPoint, airport_id: i64) -> i64 {
+        let Some(&(lat, lon, elevation)) = self.airport_locations.get(&airport_id) else {
+            return air.ts;
+        };
+        let (_, approach_kmh, descent_fpm) = self.movement_rates(icao_id, is_rotorcraft);
+        let flying = (distance_to(air, lat, lon) - 2.0).max(0.0) / approach_kmh * 3600.0;
+        let height = air.alt_ft.zip(elevation).map_or(0.0, |(a, e)| a - e);
+        let descending = (height - 200.0).max(0.0) / descent_fpm * 60.0;
+        air.ts + flying.max(descending).min(1200.0).round() as i64
+    }
+
+    // An arrival is timed at the last airborne report plus the remaining
+    // distance at approach speed, and no later than the first ground report:
+    // later ground reports date the rollout and taxi instead.
+    fn landing_time(&self, state: &TrackState, candidate: &EndpointCandidate) -> i64 {
+        let Some(touchdown) = state.touchdown else {
+            return candidate.ts;
+        };
+        let air = touchdown.air;
+        if state.max_altitude_ts.is_some_and(|m| air.ts < m)
+            || air.ts < candidate.ts - 45 * 60
+            || air.ts > candidate.ts + 15 * 60
+        {
+            return candidate.ts;
+        }
+        let ts = self.approach_end(state.icao_id, state.is_rotorcraft, &air, candidate.airport_id);
+        touchdown.ground.map_or(ts, |g| ts.min(g.ts))
+    }
+
+    // Recovered movements keep their observation interval as the bounds; the
+    // stored time is extrapolated from the observation like direct ones.
+    fn timed_arrival(&self, icao_id: u32, arrival: EndpointCandidate, departure_ts: i64) -> EndpointCandidate {
+        let ts = self.approach_end(icao_id, false, &arrival.point, arrival.airport_id);
+        EndpointCandidate { ts: ts.min(departure_ts - 60).max(arrival.ts), ..arrival }
+    }
+
+    fn timed_departure(&self, icao_id: u32, departure: EndpointCandidate, arrival_ts: i64) -> EndpointCandidate {
+        let ts = self.climb_start(icao_id, false, &departure.point, departure.airport_elevation_ft);
+        EndpointCandidate { ts: ts.max(arrival_ts + 60).min(departure.ts), ..departure }
+    }
+
     fn prior(&mut self, icao: u32) -> Result<Option<RecentFlight>> {
         if !self.recent.contains_key(&icao) {
-            let prior = self.state_conn.prepare_cached("SELECT episode_start_ts,end_ts,max_altitude_ft,points,airport_id,elevation_ft,confidence,anchor_point,callsign FROM recent_flights WHERE icao_id=?1")?
+            let prior = self.state_conn.prepare_cached("SELECT episode_start_ts,end_ts,max_altitude_ft,points,airport_id,elevation_ft,confidence,anchor_point,callsign,anchor_ts FROM recent_flights WHERE icao_id=?1")?
                 .query_row([icao], |r| {
                     let airport:Option<i64>=r.get(4)?;
                     let landing=if let Some(airport_id)=airport {
                         let points=parse_points_blob(&r.get::<_,Vec<u8>>(7)?)?;
                         let point=*points.first().ok_or(rusqlite::Error::InvalidQuery)?;
-                        Some(EndpointCandidate{ts:point.ts,airport_id,airport_elevation_ft:r.get(5)?,confidence:r.get(6)?,point})
+                        Some(EndpointCandidate{ts:r.get::<_,Option<i64>>(9)?.unwrap_or(point.ts),airport_id,airport_elevation_ft:r.get(5)?,confidence:r.get(6)?,point})
                     }else{None};
                     Ok(RecentFlight{episode:r.get(0)?,end_ts:r.get(1)?,max_altitude:r.get(2)?,points:parse_points_blob(&r.get::<_,Vec<u8>>(3)?)?,landing,callsign:r.get::<_,Option<i64>>(8)?.map(|c| c as Callsign)})
                 }).optional()?;
@@ -1706,6 +1947,72 @@ impl EventBuilder {
         })
     }
 
+    // A transport aircraft first received climbing away from a large or
+    // medium airport, on a departure gradient, left that airport. Reception
+    // at regional fields often begins thousands of feet up. A track resumed
+    // after a reception gap is excluded unless the gap leaves time to have
+    // reached the airport and turned around.
+    fn climb_out_departure(&self, state: &TrackState, prior: Option<&RecentFlight>) -> Option<EndpointCandidate> {
+        if state.open_start
+            || state.is_rotorcraft
+            || !self.transport_aircraft_ids.contains(&state.icao_id)
+            || Self::frozen_position(&state.first_points)
+        {
+            return None;
+        }
+        let first = *state
+            .first_points
+            .iter()
+            .filter(|p| !p.on_ground && p.alt_ft.is_some())
+            .min_by_key(|p| p.ts)?;
+        let altitude = first.alt_ft?;
+        let later = *state
+            .first_points
+            .iter()
+            .filter(|p| {
+                !p.on_ground
+                    && p.ts - first.ts >= 60
+                    && p.ts - first.ts <= 300
+                    && p.alt_ft.is_some_and(|a| a - altitude >= 300.0)
+            })
+            .max_by_key(|p| p.ts)?;
+        if state.max_altitude_ft? - altitude < self.min_climb_ft {
+            return None;
+        }
+        let mut best: Option<(f64, i64, f64)> = None;
+        for &(airport_id, lat, lon, elevation) in self.major_airports.near(first.lat, first.lon, 40.0) {
+            let distance = distance_to(&first, lat, lon);
+            let height = altitude - elevation;
+            if distance > 40.0
+                || height > 10000.0
+                || !(150.0..=800.0).contains(&(height / distance.max(0.1)))
+                || distance_to(&later, lat, lon) < distance + 0.5
+            {
+                continue;
+            }
+            if best.is_none_or(|(d, ..)| distance < d) {
+                best = Some((distance, airport_id, elevation));
+            }
+        }
+        let (_, airport_id, elevation) = best?;
+        let location = self.airport_locations.get(&airport_id)?;
+        if let Some(previous) = prior.filter(|p| p.landing.is_none()) {
+            if let Some(last) = previous.points.iter().filter(|p| p.alt_ft.is_some() || p.on_ground).max_by_key(|p| p.ts) {
+                let reach = great_circle_distance(last, location.0, location.1) / 800.0 * 3600.0 + 1200.0;
+                if ((first.ts - last.ts) as f64) < reach {
+                    return None;
+                }
+            }
+        }
+        Some(EndpointCandidate {
+            ts: first.ts,
+            airport_id,
+            airport_elevation_ft: Some(elevation),
+            confidence: 0.55,
+            point: first,
+        })
+    }
+
     // Presence on the ground and a later/earlier airborne observation establish
     // a necessary movement, not a precise route or runway-crossing time. Keep
     // its entire observation gap so consumers can represent that uncertainty.
@@ -1847,9 +2154,20 @@ impl EventBuilder {
         }
         let mut prior = self.prior(state.icao_id)?;
         let low_takeoff = self.infer_takeoff(state);
-        let mut takeoff = low_takeoff.or_else(|| self.observed_departure(state));
+        let mut takeoff = low_takeoff
+            .or_else(|| self.observed_departure(state))
+            .or_else(|| self.climb_out_departure(state, prior.as_ref()))
+            .map(|t| EndpointCandidate {
+                ts: self.takeoff_time(state, &t),
+                ..t
+            });
         let observed_climb = low_takeoff.is_none() && takeoff.is_some();
-        let landing = landing_override.or_else(|| self.infer_landing(state));
+        let landing = landing_override
+            .or_else(|| self.infer_landing(state))
+            .map(|l| EndpointCandidate {
+                ts: self.landing_time(state, &l),
+                ..l
+            });
         let ground_recovery = if landing.is_none() && takeoff.is_none() {
             prior.as_ref().and_then(|p| self.grounded_arrival(state, p))
         } else {
@@ -1886,7 +2204,9 @@ impl EventBuilder {
                 {
                     let mut approach = previous.clone();
                     approach.landing = None;
-                    corrected = self.corroborated_arrival(&approach, departure);
+                    corrected = self
+                        .corroborated_arrival(&approach, departure)
+                        .map(|a| self.timed_arrival(state.icao_id, a, departure.ts));
                 }
             }
             let endpoint = corrected.unwrap_or(pending.endpoint);
@@ -1895,7 +2215,11 @@ impl EventBuilder {
                 pending.episode,
                 "landing",
                 endpoint,
-                endpoint.ts,
+                if corrected.is_some() {
+                    endpoint.point.ts
+                } else {
+                    endpoint.ts
+                },
                 if corrected.is_some() {
                     takeoff.unwrap().ts
                 } else {
@@ -1936,12 +2260,13 @@ impl EventBuilder {
             if !state.is_rotorcraft {
                 if let Some(departure) = takeoff {
                     if let Some(arrival) = self.corroborated_arrival(previous, departure) {
+                        let arrival = self.timed_arrival(state.icao_id, arrival, departure.ts);
                         self.insert_movement(
                             state.icao_id,
                             previous.episode,
                             "landing",
                             arrival,
-                            arrival.ts,
+                            arrival.point.ts,
                             departure.ts,
                             "arrival_corroborated",
                             previous.callsign,
@@ -1959,12 +2284,13 @@ impl EventBuilder {
                             })
                     {
                         if let Some(arrival) = self.gap_arrival(previous, departure) {
+                            let arrival = self.timed_arrival(state.icao_id, arrival, departure.ts);
                             self.insert_movement(
                                 state.icao_id,
                                 previous.episode,
                                 "landing",
                                 arrival,
-                                arrival.ts,
+                                arrival.point.ts,
                                 departure.ts,
                                 "arrival_observation_gap",
                                 previous.callsign,
@@ -2005,13 +2331,14 @@ impl EventBuilder {
                         }
                     }
                 } else if let Some(departure) = self.corroborated_departure(state, previous) {
+                    let departure = self.timed_departure(state.icao_id, departure, previous.end_ts);
                     self.insert_movement(
                         state.icao_id,
                         state.segment_start_ts,
                         "takeoff",
                         departure,
                         previous.end_ts,
-                        departure.ts,
+                        departure.point.ts,
                         "departure_corroborated",
                         departure_callsign(departure.ts),
                     )?;
@@ -2029,13 +2356,14 @@ impl EventBuilder {
                     })
                 {
                     if let Some(departure) = self.gap_departure(state, previous) {
+                        let departure = self.timed_departure(state.icao_id, departure, previous.end_ts);
                         self.insert_movement(
                             state.icao_id,
                             state.segment_start_ts,
                             "takeoff",
                             departure,
                             previous.end_ts,
-                            departure.ts,
+                            departure.point.ts,
                             "departure_observation_gap",
                             departure_callsign(departure.ts),
                         )?;
@@ -2313,6 +2641,8 @@ impl EventBuilder {
                         open_start: open_start_cutoff_ts
                             .is_some_and(|cutoff| summary.first_ts <= cutoff),
                         callsigns: Vec::new(),
+                        liftoff: None,
+                        touchdown: None,
                     },
                 );
                 self.state_order.push(summary.icao_id);
@@ -2351,7 +2681,7 @@ impl EventBuilder {
             [self.observed_through - 48 * 3600],
         )?;
         {
-            let mut put = self.state_conn.prepare_cached("INSERT INTO recent_flights(icao_id,episode_start_ts,end_ts,max_altitude_ft,points,airport_id,elevation_ft,confidence,anchor_point,callsign) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(icao_id) DO UPDATE SET episode_start_ts=excluded.episode_start_ts,end_ts=excluded.end_ts,max_altitude_ft=excluded.max_altitude_ft,points=excluded.points,airport_id=excluded.airport_id,elevation_ft=excluded.elevation_ft,confidence=excluded.confidence,anchor_point=excluded.anchor_point,callsign=excluded.callsign")?;
+            let mut put = self.state_conn.prepare_cached("INSERT INTO recent_flights(icao_id,episode_start_ts,end_ts,max_altitude_ft,points,airport_id,elevation_ft,confidence,anchor_point,callsign,anchor_ts) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(icao_id) DO UPDATE SET episode_start_ts=excluded.episode_start_ts,end_ts=excluded.end_ts,max_altitude_ft=excluded.max_altitude_ft,points=excluded.points,airport_id=excluded.airport_id,elevation_ft=excluded.elevation_ft,confidence=excluded.confidence,anchor_point=excluded.anchor_point,callsign=excluded.callsign,anchor_ts=excluded.anchor_ts")?;
             let mut ordered: Vec<_> = self.recent_dirty.iter().collect();
             ordered.sort_unstable();
             for id in ordered {
@@ -2371,13 +2701,14 @@ impl EventBuilder {
                         anchor.and_then(|a| a.airport_elevation_ft),
                         anchor.map(|a| a.confidence),
                         point,
-                        r.callsign.map(|c| c as i64)
+                        r.callsign.map(|c| c as i64),
+                        anchor.map(|a| a.ts)
                     ])?;
                 }
             }
         }
         {
-            let mut put=self.state_conn.prepare_cached("INSERT INTO pending_landings VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(icao_id) DO UPDATE SET episode=excluded.episode,airport_id=excluded.airport_id,elevation=excluded.elevation,confidence=excluded.confidence,point=excluded.point,callsign=excluded.callsign")?;
+            let mut put=self.state_conn.prepare_cached("INSERT INTO pending_landings VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(icao_id) DO UPDATE SET episode=excluded.episode,airport_id=excluded.airport_id,elevation=excluded.elevation,confidence=excluded.confidence,point=excluded.point,callsign=excluded.callsign,ts=excluded.ts")?;
             let mut remove = self
                 .state_conn
                 .prepare_cached("DELETE FROM pending_landings WHERE icao_id=?1")?;
@@ -2391,7 +2722,8 @@ impl EventBuilder {
                         e.airport_elevation_ft,
                         e.confidence,
                         points_blob(&[e.point]),
-                        p.callsign.map(|c| c as i64)
+                        p.callsign.map(|c| c as i64),
+                        e.ts
                     ])?;
                 } else {
                     remove.execute([id])?;
@@ -2405,8 +2737,9 @@ impl EventBuilder {
                 INSERT INTO track_states(
                     icao_id, is_rotorcraft, segment_start_ts, segment_end_ts, last_seen_ts,
                     first_points, last_points, point_count, max_altitude_ft,
-                    max_altitude_ts, source_first_file, source_last_file, open_start, callsigns
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    max_altitude_ts, source_first_file, source_last_file, open_start, callsigns,
+                    liftoff, touchdown
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 "#,
             )?;
             for icao_id in &self.state_order {
@@ -2416,7 +2749,7 @@ impl EventBuilder {
                 let row = state.row_tuple();
                 stmt.execute(params![
                     row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9, row.10,
-                    row.11, row.12, row.13
+                    row.11, row.12, row.13, row.14, row.15
                 ])?;
             }
         }
