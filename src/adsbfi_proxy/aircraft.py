@@ -20,6 +20,7 @@ from .paths import (
     FAA_ZIP,
     OPENSKY_AIRCRAFT_DB,
     TAR1090_AIRCRAFT_DB,
+    TAR1090_TYPES_DB,
 )
 from .schema import AIRCRAFT_SCHEMA, connect, set_meta, vacuum
 
@@ -316,6 +317,8 @@ def classify_aircraft(
     short_type: str | None = None,
     military: bool = False,
 ) -> str:
+    # Some registers append the manufacturer to the model: "172M (Cessna)".
+    model = re.sub(r"\s*\([^()]*\)\s*$", "", model) if model else model
     text = classifier_text(manufacturer, model, icao_type)
     short = classifier_text(None, short_type)
 
@@ -339,8 +342,10 @@ def classify_aircraft(
     ):
         return "piston"
     # FAA reciprocating engine codes outrank text: manufacturer names such as
-    # Hawker Beechcraft otherwise match business-jet patterns.
-    if type_engine_code in {"1", "01", "7", "8", "11"}:
+    # Hawker Beechcraft otherwise match business-jet patterns. A turbine
+    # descriptor outranks the FAA code, which misses conversions (PA-46 JetPROP).
+    descriptor = (short_type or "").strip().upper()
+    if (type_engine_code in {"1", "01", "7", "8", "11"} and not re.fullmatch(r"[LAS][1-8][TJ]", descriptor)) or re.fullmatch(r"[LAS][1-8]P", descriptor):
         return "piston"
     if matches_any(text, TURBOPROP_AIRLINER_PATTERNS):
         return "commercial_turboprop"
@@ -569,6 +574,26 @@ def load_opensky_records(path: Path, records: dict[int, AircraftRecord]) -> int:
     return count
 
 
+def fill_airframes(path: Path, records: dict[int, AircraftRecord]) -> int:
+    """Derive missing airframe descriptors (e.g. L2J) from the ICAO type designator table.
+
+    Registry rows sometimes carry a type designator without a descriptor, and an
+    upstream refresh can drop a descriptor that an older snapshot had.
+    """
+    if not path.exists():
+        return 0
+    raw = path.read_bytes()
+    # tar1090-db serves this file gzip-compressed despite its .js name.
+    designators = json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw)
+    filled = 0
+    for record in records.values():
+        entry = designators.get(record.icao_type) if record.icao_type and not record.short_type else None
+        if entry and len(entry) > 1 and entry[1]:
+            record.short_type = entry[1]
+            filled += 1
+    return filled
+
+
 def write_airframe_index(connection: sqlite3.Connection) -> None:
     """Cache physical flags once at import, rather than scan the registry per slot.
 
@@ -649,6 +674,7 @@ def import_aircraft(
     adsbx_path: Path = ADSBX_BASIC_AIRCRAFT_DB,
     tar1090_path: Path = TAR1090_AIRCRAFT_DB,
     opensky_path: Path = OPENSKY_AIRCRAFT_DB,
+    types_path: Path = TAR1090_TYPES_DB,
 ) -> dict:
     records: dict[int, AircraftRecord] = {}
     if not opensky_path.exists():
@@ -659,6 +685,7 @@ def import_aircraft(
         "tar1090_rows": load_tar1090_records(tar1090_path, records),
         "opensky_rows": load_opensky_records(opensky_path, records),
     }
+    details["airframes_from_type"] = fill_airframes(types_path, records)
     result = write_aircraft_db(db_path, records, details)
     result["owner_sources"] = import_owners(db_path, adsbx_path, opensky_path)
     return result
@@ -683,8 +710,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--adsbx-basic-db", type=Path, default=ADSBX_BASIC_AIRCRAFT_DB)
     parser.add_argument("--tar1090-db", type=Path, default=TAR1090_AIRCRAFT_DB)
     parser.add_argument("--opensky-csv", type=Path, default=OPENSKY_AIRCRAFT_DB)
+    parser.add_argument("--types-db", type=Path, default=TAR1090_TYPES_DB)
     args = parser.parse_args(argv)
-    print(import_aircraft(args.db, args.faa_zip, args.adsbx_basic_db, args.tar1090_db, args.opensky_csv))
+    print(import_aircraft(args.db, args.faa_zip, args.adsbx_basic_db, args.tar1090_db, args.opensky_csv, args.types_db))
 
 
 if __name__ == "__main__":

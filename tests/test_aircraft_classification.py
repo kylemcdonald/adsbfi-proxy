@@ -58,3 +58,10 @@ class AircraftClassificationTests(unittest.TestCase):
             with self.subTest(model=model):
                 self.assertEqual(classify_aircraft(manufacturer=manufacturer, model=model), expected)
         self.assertEqual(classify_aircraft(model='EC 130 B4', type_aircraft_code='6'), 'helicopter')
+
+    def test_register_formatting_and_piston_descriptors(self):
+        self.assertEqual(classify_aircraft(manufacturer='Cessna Aircraft Company', model='172M (Cessna)'), 'piston')
+        self.assertEqual(classify_aircraft(icao_type='PA18', short_type='L1P', model='PA-18 "150"'), 'piston')
+        self.assertEqual(classify_aircraft(icao_type='C337', short_type='L2P'), 'piston')
+        self.assertEqual(classify_aircraft(icao_type='B350', short_type='L2T'), 'turboprop')
+        self.assertEqual(classify_aircraft(manufacturer='PIPER', model='PA 46-350P', icao_type='P46T', short_type='L1T', type_engine_code='1'), 'turboprop')
