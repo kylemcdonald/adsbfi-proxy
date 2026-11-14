@@ -387,6 +387,70 @@ def evaluate(flights, endpoints, window, domestic, details=None):
     return report
 
 
+def evaluate_goode(flights, events_db, day, tolerance):
+    """Goode (2026), section 5.3: flights taking off on the UTC day, both times within tolerance.
+
+    Gold flights are BTS flights with wheels-off on the UTC day. Test flights are
+    consecutive takeoff -> landing endpoints of gold aircraft whose takeoff falls on
+    that day. Every unmatched test flight counts against precision, including
+    international and unreported legs.
+    """
+    start = dt.datetime.combine(day, dt.time(), dt.timezone.utc).timestamp()
+    end = start + 86400
+    gold = [f for f in flights if start <= f["off"] < end]
+    by_icao = defaultdict(list)
+    for f in gold:
+        by_icao[f["icao"]].append(f)
+    endpoints = load_endpoints(events_db, by_icao, start - 86400, end + 86400)
+    totals = Counter()
+    bias = ([], [])
+    for icao, gold_flights in by_icao.items():
+        rows = endpoints.get(icao, [])
+        tests = [
+            (a, b) for a, b in zip(rows, rows[1:])
+            if not a[1] and b[1] and start <= a[0] < end and b[0] - a[0] <= 86400
+        ]
+        totals["test"] += len(tests)
+        totals["zero"] += not tests
+        pairs = sorted(
+            (abs(t[0][0] - f["off"]) + abs(t[1][0] - f["on"]), fi, ti)
+            for fi, f in enumerate(gold_flights)
+            for ti, t in enumerate(tests)
+            if abs(t[0][0] - f["off"]) <= tolerance and abs(t[1][0] - f["on"]) <= tolerance
+        )
+        used_f, used_t = set(), set()
+        for _, fi, ti in pairs:
+            if fi in used_f or ti in used_t:
+                continue
+            used_f.add(fi)
+            used_t.add(ti)
+            f, t = gold_flights[fi], tests[ti]
+            totals["matched"] += 1
+            totals["to_ok"] += t[0][2] == f["origin_id"]
+            totals["ld_ok"] += t[1][2] == f["dest_id"]
+            bias[0].append(t[0][0] - f["off"])
+            bias[1].append(t[1][0] - f["on"])
+    p = 100 * totals["matched"] / totals["test"] if totals["test"] else 0
+    r = 100 * totals["matched"] / len(gold) if gold else 0
+    return dict(
+        protocol="goode-2026",
+        day=day.isoformat(),
+        tolerance_min=tolerance / 60,
+        gold_icaos=len(by_icao),
+        gold_flights=len(gold),
+        test_flights=totals["test"],
+        matched=totals["matched"],
+        precision=round(p, 2),
+        recall=round(r, 2),
+        f1=round(2 * p * r / (p + r), 2) if p and r else None,
+        zero_flight_icaos_pct=round(100 * totals["zero"] / len(by_icao), 2) if by_icao else None,
+        airport_accuracy_to=round(100 * totals["to_ok"] / totals["matched"], 2) if totals["matched"] else None,
+        airport_accuracy_ld=round(100 * totals["ld_ok"] / totals["matched"], 2) if totals["matched"] else None,
+        time_bias_to_min=round(statistics.fmean(bias[0]) / 60, 2) if bias[0] else None,
+        time_bias_ld_min=round(statistics.fmean(bias[1]) / 60, 2) if bias[1] else None,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--events", type=Path, required=True)
@@ -397,6 +461,8 @@ def main():
     parser.add_argument("--window", type=float, default=20, help="Match window in minutes")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--details", type=Path, help="Write per-movement match rows (JSON lines)")
+    parser.add_argument("--goode", action="store_true",
+                        help="Score each date with Goode's protocol (UTC day, 60-minute tolerance unless --window is given)")
     args = parser.parse_args()
     dates = set()
     for value in args.date:
@@ -406,6 +472,17 @@ def main():
         else:
             dates.add(dt.date.fromisoformat(value))
     iata = load_iata_map(args.ourairports, args.airports)
+    if args.goode:
+        # A UTC day's departures span the neighbouring local FlightDates.
+        local = {d + dt.timedelta(days=k) for d in dates for k in (-1, 0, 1)}
+        flights, _ = load_bts(args.bts, local, iata, Zones())
+        tolerance = (args.window if "--window" in __import__("sys").argv else 60) * 60
+        reports = [evaluate_goode(flights, args.events, d, tolerance) for d in sorted(dates)]
+        text = json.dumps(reports if len(reports) > 1 else reports[0], indent=2)
+        print(text)
+        if args.report:
+            args.report.write_text(text + "\n")
+        return
     flights, skipped = load_bts(args.bts, dates, iata, Zones())
     window = args.window * 60
     icaos = {f["icao"] for f in flights}

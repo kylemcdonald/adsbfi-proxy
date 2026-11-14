@@ -175,17 +175,30 @@ Most remaining helicopter mismatches are at heliports beside an airport.
 
 ### Comparison with Goode (2026)
 
-On BTS 2026-03-01, Goode's best segmentation reached flight F1 94.50 from
-ADSB.lol data and 92.20 from ADS-B Exchange data. His neural airport model
-reached 97.0/95.5% takeoff/landing airport accuracy on ADSB.lol. On ADS-B
-Exchange it reached 99.99/96.21%.
+Goode's paper (OpenSky Symposium 2026) scores flights differently from the
+tables above:
 
-V6 on adsb.fi reaches F1 96.3 on that day, with airport accuracy 99.94/99.93%.
-It does this with explicit rules and no trained model.
+- gold flights are BTS flights that take off on the UTC day;
+- a test flight matches when both of its times fall within 60 minutes;
+- every unmatched test flight of a gold aircraft counts against precision,
+  including international and unreported legs.
 
-The protocols are not identical. His flight set was 15,951 flights and ours is
-19,191. Each source has different coverage, and our time window is ±20
-minutes. The comparison is indicative, not a controlled benchmark.
+`bts_eval.py --goode` reproduces this protocol. Our UTC-day set has 17,907
+flights on 4,715 aircraft, against his 15,951 flights on 4,719, so his exact
+gold filter is not reproduced. On 2026-03-01:
+
+| System | ADS-B data | Flight P / R / F1 | TO / LD airport | TO / LD time bias (min) |
+| --- | --- | --- | --- | --- |
+| Goode, readsb legs + neural network | OpenSky, 3 days of context | 92.26 / 96.87 / 94.50 | 97.00 / 95.51 | 1.01 / 0.64 |
+| Goode, neural network | ADS-B Exchange, single day | 88.67 / 96.03 / 92.20 | 99.99 / 96.21 | |
+| Goode, neural network | ADSB.lol, single day | 89.02 / 92.80 / 90.87 | 99.39 / 95.53 | |
+| ADS-B Exchange published flights | ADS-B Exchange | 94.31 / 89.19 / 91.68 | 100.00 / 99.97 | 0.61 / 0.91 |
+| v5 rules | adsb.fi | 89.13 / 91.47 / 90.29 | 99.99 / 99.98 | −2.66 / +2.88 |
+| **v6** | adsb.fi | 91.68 / 95.49 / 93.55 | 99.96 / 99.94 | +0.13 / +0.29 |
+
+Over Mar 1–6, v6 scores F1 92.6–93.9 under this protocol. Segmentation is on a
+par with his best configuration. Airport accuracy and timing are much better,
+and v6 uses explicit rules with no trained model.
 
 His talk's main points are reflected here:
 
