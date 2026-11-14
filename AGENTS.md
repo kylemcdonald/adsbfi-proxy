@@ -1,6 +1,6 @@
 # Development
 
-Endpoint ledger v6 is canonical; no pjet or paired-flight compatibility is required.
+Endpoint ledger v6 is canonical; no paired-flight compatibility is required.
 Use fresh versioned databases for inference changes. Preserve rolling track state
 across restarts, and never advance a checkpoint before endpoint rows are committed. Backfills must remain rate-limited and resumable.
 

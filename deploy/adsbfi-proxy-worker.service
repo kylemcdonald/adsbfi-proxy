@@ -1,5 +1,5 @@
 [Unit]
-Description=ADS-B Exchange download, mirror, and rolling flight builder
+Description=adsb.fi heatmap download and rolling takeoff/landing builder
 After=network-online.target
 Wants=network-online.target
 
