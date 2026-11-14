@@ -46,7 +46,8 @@ def main():
         from .server import serve
         serve(config, args.host, args.port)
     elif args.command == 'status':
-        print((config.db / 'proxy-status.json').read_text())
+        status = config.db / 'proxy-status.json'
+        print(status.read_text() if status.exists() else f'No worker status yet at {status}')
     elif args.command == 'import-airports':
         from .airports import import_airports
         print(json.dumps(import_airports(), indent=2))
