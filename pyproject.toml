@@ -3,6 +3,7 @@ name = "adsbfi-proxy"
 version = "0.1.0"
 description = "Rolling adsb.fi heatmap mirror and SQLite takeoff/landing ledger"
 requires-python = ">=3.12"
+license = "MIT"
 dependencies = []
 
 [project.optional-dependencies]

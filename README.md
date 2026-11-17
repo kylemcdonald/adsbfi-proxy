@@ -348,3 +348,8 @@ Data sources:
 
 None of these datasets is redistributed here. Thanks to Jonah Goode for the
 BTS evaluation design and the PlaneQuery comparison.
+
+## License
+
+The code is released under the [MIT License](LICENSE). Data sources keep
+their own terms.
