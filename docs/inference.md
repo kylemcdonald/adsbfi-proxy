@@ -1,4 +1,4 @@
-# Endpoint v6
+# Endpoint v6 and v7
 
 V6 is the first inference run on adsb.fi heatmaps. It keeps the v5 rules and
 adds three things: movement times at liftoff and touchdown rather than at the
@@ -7,6 +7,9 @@ airport choices checked against the airport where the aircraft last landed.
 V6 was developed against two kinds of truth that need no hand labelling:
 scheduled airline flights from BTS, and the continuity of each aircraft between
 a landing and its next takeoff.
+
+V7 keeps every v6 rule and corrects the references it reads; see
+[V7](#v7).
 
 ## Ground truth
 
@@ -221,6 +224,57 @@ errors are mostly consistent pairs at an airport and its neighbour:
 In each case both the arrival and the departure name the neighbour, so
 continuity cannot detect them.
 
+## V7
+
+V7 changes what the builder knows about airports and aircraft, not how it
+segments tracks or times movements.
+
+- **Runways** ([#1](https://github.com/kylemcdonald/adsbfi-proxy/issues/1)).
+  `import-airports` also loads OurAirports runway centrelines. A fixed-wing
+  report within 0.5 km of a land airport's runway is measured to that runway
+  rather than to the airport's reference point. A large airport's reference
+  point can be farther from its own ramp than a neighbouring seaplane base is.
+  FedEx feeder Caravans parked at Logan's cargo ramp, 0.3 km from runway 14,
+  were assigned to the Boston Harbor seaplane base 0.8 km away. Morningstar's
+  Caravans beside the 26L threshold at Vancouver went to CAM9. Floatplanes on
+  the Fraser River, 0.85 km from the runway, keep CAM9. Approach and climb-out
+  reports farther out still use reference points: applying runway distance at
+  any range moved airline movements at Fort Myers, Little Rock and Amarillo to
+  a smaller neighbour's runway. Rotorcraft also keep reference points.
+- **Airframes from the ICAO type**
+  ([#2](https://github.com/kylemcdonald/adsbfi-proxy/issues/2)). When a record's
+  ICAO type is in the designator table, its airframe descriptor comes from the
+  table. A registry descriptor that disagrees is usually left over from an
+  earlier aircraft on a reused registration: a King Air 350 carried a Grob
+  trainer's L1P, a Challenger 300 and a G450 were classed as piston. A registry
+  descriptor is kept when it only adds amphibian or float gear (A1T for L1T).
+  783 descriptors changed.
+- **Type names** ([#5](https://github.com/kylemcdonald/adsbfi-proxy/issues/5)).
+  A record that registry text cannot classify, or that has no manufacturer or
+  model, is classified from its designator's name, e.g. "CESSNA 700 Citation
+  Longitude". Unknown jets fell from 4,806 to 1,804 and business jets rose from
+  35,928 to 38,517. Rotorcraft descriptors are
+  left alone: "UH-60 Black Hawk" would otherwise read as a Hawk trainer.
+- **Corporate airliners**
+  ([#4](https://github.com/kylemcdonald/adsbfi-proxy/issues/4)). BBJ and ACJ are
+  recognised as suffixes ("A319-133ACJ") and inside parentheses
+  ("737-7BC(BBJ)").
+- **Airport codes and ids**
+  ([#3](https://github.com/kylemcdonald/adsbfi-proxy/issues/3)). An OurAirports
+  placeholder ident such as `US-0370` is replaced by the field's `gps_code` or
+  `local_code` (MA87) when no other airport uses it. `airport_id` is now the
+  OurAirports numeric id, so it stays fixed when a code changes. This changed
+  6,991 codes.
+
+An experiment that also treated every rotorcraft descriptor as rotorcraft in the
+builder, including military helicopters, lowered continuity (99.394% against
+99.424% on Jun 8–16) and was dropped.
+
+On the evaluation replays, v7 matches v6 on BTS exactly: no airline movement
+changed. Continuity rises from 99.410% to 99.413% (Feb 26–Mar 7) and from
+99.412% to 99.415% (Jun 8–16). Caravan movements at seaplane bases fall from
+517 to 75 and from 751 to 346.
+
 ## Reproduction
 
 ```sh
@@ -237,6 +291,8 @@ A replay of ten days takes under a minute. Leave a margin of one day on both
 sides of the scored BTS dates. Flights that end after the replay are missing,
 which lowers recall on the last day.
 
-V6 needs fresh event and state databases (`endpoints-v6`, state layout
-`transitions-1`), and the aircraft reference must include `icao_type` and
-`airframe`.
+V7 needs fresh event and state databases (`endpoints-v7`, state layout
+`transitions-1`). Import airports with runways and aircraft with this version
+first: the aircraft reference must include `icao_type` and `airframe`. An
+airports database without a `runways` table still works, without the runway
+rule.

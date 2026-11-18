@@ -17,7 +17,7 @@ const SLICE_BEGIN_MARKER: i32 = 0x0e7f7c9d;
 const MAX_ICAO_ID: u32 = 0x00ff_ffff;
 const EARTH_RADIUS_KM: f64 = 6371.0088;
 
-const INFERENCE_VERSION: &str = "endpoints-v6";
+const INFERENCE_VERSION: &str = "endpoints-v7";
 // Only the columns readers and replay deduplication need are stored.
 // compact-2 adds a dictionary-encoded callsign to each endpoint.
 const LEDGER_SCHEMA: &str = "compact-2";
@@ -28,6 +28,8 @@ const STATE_LAYOUT: &str = "transitions-1";
 const MAX_CALLSIGNS: usize = 8;
 // Multi-engine and turbine landplane types that are commonly operated on floats.
 // Other such types never use a seaplane base, which otherwise wins beside a runway.
+// Reports this close to a runway centreline are on the airfield.
+const RUNWAY_SNAP_KM: f64 = 0.5;
 const FLOAT_CAPABLE_TYPES: &[&str] = &["DHC6", "C208", "K100", "DH2T", "DH3T", "PC6T", "P750", "AT8T"];
 
 const EVENTS_SCHEMA: &str = r#"
@@ -680,6 +682,42 @@ struct Airport {
     water: bool,
     ultralight: bool,
     small: bool,
+    // Runway centrelines as (lat, lon, lat, lon); empty when OurAirports has none.
+    runways: Vec<[f64; 4]>,
+}
+
+impl Airport {
+    // A fixed-wing report beside a land airport's runway is at that airport: a
+    // large airport's reference point can be farther from its own cargo ramp than
+    // a neighbouring seaplane base is. Farther out, on approach or climb-out, the
+    // reference point stays the measure, so a neighbour's runway does not win.
+    fn distance_km(&self, lat: f64, lon: f64, cos_phi1: f64, fixed_wing: bool) -> f64 {
+        let reference = haversine_from_query_km(lat, lon, cos_phi1, self);
+        if !fixed_wing || self.water {
+            return reference;
+        }
+        self.runways
+            .iter()
+            .map(|runway| segment_distance_km(lat, lon, cos_phi1, runway))
+            .filter(|distance| *distance <= RUNWAY_SNAP_KM)
+            .fold(reference, f64::min)
+    }
+}
+
+// Distance from a point to a short segment on a local equirectangular projection.
+fn segment_distance_km(lat: f64, lon: f64, cos_phi1: f64, segment: &[f64; 4]) -> f64 {
+    const KM_PER_DEGREE: f64 = 111.195;
+    let east = |other: f64| (((other - lon) + 540.0).rem_euclid(360.0) - 180.0) * KM_PER_DEGREE * cos_phi1;
+    let (ax, ay) = (east(segment[1]), (segment[0] - lat) * KM_PER_DEGREE);
+    let (bx, by) = (east(segment[3]), (segment[2] - lat) * KM_PER_DEGREE);
+    let (dx, dy) = (bx - ax, by - ay);
+    let length2 = dx * dx + dy * dy;
+    let t = if length2 > 0.0 {
+        (-(ax * dx + ay * dy) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (ax + t * dx).hypot(ay + t * dy)
 }
 
 struct AirportIndex {
@@ -699,6 +737,24 @@ impl AirportIndex {
             ORDER BY a.airport_id
             "#,
         )?;
+        let mut runways: HashMap<i64, Vec<[f64; 4]>> = HashMap::default();
+        let has_runways: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='runways')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_runways {
+            let mut runway_stmt =
+                conn.prepare("SELECT airport_id, le_lat_e7, le_lon_e7, he_lat_e7, he_lon_e7 FROM runways")?;
+            let mut runway_rows = runway_stmt.query([])?;
+            while let Some(row) = runway_rows.next()? {
+                let end = |i: usize| -> rusqlite::Result<f64> { Ok(row.get::<_, i64>(i)? as f64 / 1e7) };
+                runways
+                    .entry(row.get(0)?)
+                    .or_default()
+                    .push([end(1)?, end(2)?, end(3)?, end(4)?]);
+            }
+        }
         let mut rows = stmt.query([])?;
         let mut grid: HashMap<(i32, i32), Vec<Airport>> = HashMap::default();
         let cell_degrees = 0.1_f64;
@@ -713,8 +769,9 @@ impl AirportIndex {
             let lon_e7: i64 = row.get(2)?;
             let lat = lat_e7 as f64 / 1e7;
             let lon = lon_e7 as f64 / 1e7;
+            let airport_id: i64 = row.get(0)?;
             let airport = Airport {
-                airport_id: row.get(0)?,
+                airport_id,
                 lat,
                 lon,
                 elevation_ft: row.get::<_, Option<i64>>(3)?.map(|value| value as f64),
@@ -723,6 +780,7 @@ impl AirportIndex {
                 water: normalized == "seaplane_base",
                 ultralight: name.to_lowercase().contains("ultralight"),
                 small: normalized == "small_airport",
+                runways: runways.remove(&airport_id).unwrap_or_default(),
             };
             grid.entry(cell_for(cell_degrees, lat, lon))
                 .or_default()
@@ -769,7 +827,7 @@ impl AirportIndex {
                         {
                             continue;
                         }
-                        let distance = haversine_from_query_km(lat, lon, cos_phi1, airport);
+                        let distance = airport.distance_km(lat, lon, cos_phi1, profile != 0);
                         // A modest type preference resolves nearby small reference entries,
                         // without excluding genuine small airports or changing the search radius.
                         let cost = distance
@@ -1088,7 +1146,7 @@ impl EventBuilder {
             || version.as_deref().is_some_and(|v| v != INFERENCE_VERSION)
         {
             return Err(anyhow!(
-                "Use fresh events/state databases for endpoints-v6; rebuild separately before switching readers"
+                "Use fresh events/state databases for endpoints-v7; rebuild separately before switching readers"
             ));
         }
         let ledger: Option<String> = events_conn
@@ -3939,6 +3997,7 @@ mod endpoint_tests {
             water,
             small,
             ultralight,
+            runways: Vec::new(),
         }
     }
     fn index(airports: Vec<Airport>) -> AirportIndex {
@@ -3962,6 +4021,30 @@ mod endpoint_tests {
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 1).unwrap().airport_id, 2); // amphibious/unknown fixed wing retains water candidate
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 2).unwrap().airport_id, 3); // known jets
         assert_eq!(i.nearest(0.0, 0.0, 12.0, 3).unwrap().airport_id, 3); // twins and turbine landplanes
+    }
+    #[test]
+    fn runways_place_ramps_at_the_land_airport_not_a_neighbouring_seaplane_base() {
+        // kylemcdonald/adsbfi-proxy#1: Logan's reference point is 1.1 km from the
+        // cargo ramp beside runway 14, the Boston Harbor seaplane base 0.8 km.
+        let mut logan = airport(1, 42.36197, -71.0079, false, false, false, false);
+        logan.runways = vec![[42.3566, -71.0233, 42.3486, -71.0082]];
+        let harbor = airport(2, 42.352502, -71.025832, false, true, false, false);
+        let i = index(vec![logan, harbor]);
+        let ramp = (42.35873, -71.02067);
+        assert_eq!(i.nearest(ramp.0, ramp.1, 12.0, 1).unwrap().airport_id, 1);
+        assert!(i.nearest(ramp.0, ramp.1, 12.0, 1).unwrap().distance_km < 0.4);
+        // A floatplane on the water beside the seaplane base keeps it.
+        assert_eq!(i.nearest(42.3526, -71.0257, 12.0, 1).unwrap().airport_id, 2);
+        // Rotorcraft still measure from reference points.
+        assert_eq!(i.nearest(ramp.0, ramp.1, 12.0, 0).unwrap().airport_id, 2);
+    }
+    #[test]
+    fn segment_distance_handles_ends_and_interior() {
+        let runway = [0.0, 0.0, 0.0, 0.01];
+        let cos = 1.0;
+        assert!((segment_distance_km(0.001, 0.005, cos, &runway) - 0.111).abs() < 0.001);
+        assert!((segment_distance_km(0.0, 0.02, cos, &runway) - 1.112).abs() < 0.001);
+        assert!(segment_distance_km(0.0, 0.004, cos, &runway) < 1e-9);
     }
     #[test]
     fn small_airports_are_not_blanket_excluded() {

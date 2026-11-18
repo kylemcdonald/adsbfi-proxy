@@ -71,11 +71,14 @@ was adopted:
 
 ### Airports
 
-Airports come from [OurAirports](https://ourairports.com/data/). An endpoint
-needs a supporting report within the first or last 8 minutes of a track. That
-report must be on the ground, or less than 1,500 ft above a field within 12 km.
-The builder chooses the nearest compatible airport and checks it against the
-aircraft's motion:
+Airports and runways come from [OurAirports](https://ourairports.com/data/).
+An endpoint needs a supporting report within the first or last 8 minutes of a
+track. That report must be on the ground, or less than 1,500 ft above a field
+within 12 km. The builder chooses the nearest compatible airport and checks it
+against the aircraft's motion. Distance is measured to an airport's reference
+point, or for fixed-wing aircraft to a land runway within 0.5 km, so a ramp
+beside a runway belongs to that airport rather than to a seaplane base next
+door.
 
 - **Compatible references.** Each aircraft class sees only plausible fields:
   - rotorcraft may use any airport or heliport;
@@ -180,7 +183,7 @@ the same airport. A mismatch means one of three things:
 - a whole flight went untracked;
 - the aircraft was moved by road.
 
-On a 10-day replay, 99.41% of 912,959 landing→takeoff pairs agree:
+On a 10-day replay, 99.41% of 913,099 landing→takeoff pairs agree:
 
 | Class | Same airport |
 | --- | --- |
@@ -276,7 +279,10 @@ an incompatible checkpoint.
 
 Each aircraft gets a registration, an ICAO type, a physical airframe
 descriptor (e.g. `L2J`) and a class: commercial jet, business jet, turboprop,
-piston, helicopter, and so on. `import-aircraft-owners --download` refreshes
+piston, helicopter, and so on. The descriptor comes from tar1090-db's ICAO type
+table when the type is known, because registry descriptors can belong to an
+earlier aircraft on a reused registration. An aircraft that registry text
+cannot classify is classified from its type's name. `import-aircraft-owners --download` refreshes
 only the owner and operator names.
 
 ### Deployment
@@ -299,7 +305,9 @@ meta(key, value)        -- inference_version, ledger_schema, counts, time bounds
 The other tables are:
 
 - `icao_id`, the 24-bit ICAO address, joins `aircraft.sqlite`;
-- `airport_id`, the OurAirports ID, joins `airports.sqlite`;
+- `airport_id`, the OurAirports ID, joins `airports.sqlite`. An airport's
+  code is its OurAirports ident, or its GPS or local code when the ident is a
+  placeholder such as `US-0370`;
 - `ts` is UTC seconds;
 - `endpoint_id` increases with insertion, not event time, so consumers should
   checkpoint on it.

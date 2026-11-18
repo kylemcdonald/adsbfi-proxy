@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_aircraft_time ON endpoints(icao_id,ts,is_landing);
 CREATE INDEX IF NOT EXISTS idx_endpoints_airport_time ON endpoints(airport_id,ts,icao_id,is_landing);
 
-INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v6');
+INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v7');
 INSERT OR IGNORE INTO meta(key,value) VALUES('ledger_schema','compact-2');
 """
 
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS track_states (
     touchdown BLOB
 );
 
-INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v6');
+INSERT OR IGNORE INTO meta(key,value) VALUES('inference_version','endpoints-v7');
 INSERT OR IGNORE INTO meta(key,value) VALUES('state_layout','transitions-1');
 """
 
