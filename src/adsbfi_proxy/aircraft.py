@@ -77,7 +77,7 @@ AIRLINER_PATTERNS = (
     r"\bAIRBUS\b.*\b(?:220|300|310|318|319|320|321|330|340|350|380)[A-Z0-9]*\b",
     r"\b(?:CS|BCS)\s?(?:100|300|1|3)\b",
     r"\bBD\s?500\s?1A1[01]\b",
-    r"\bB(?:37M|38M|39M|3M[89]|3[0-9A-Z]{2}|7(?:0[237]|1[237]|2[237]|3[0-9A-Z]|4[0-9A-Z]|5[0-9A-Z]|6[0-9A-Z]|7[0-9A-Z]|8[0-9A-Z]))\b",
+    r"\bB(?:37M|38M|39M|3M[89]|3[0-9X]M|7(?:0[237]|1[237]|2[237]|3[0-9A-Z]|4[0-9A-Z]|5[0-9A-Z]|6[0-9A-Z]|7[0-9A-Z]|8[0-9A-Z]))\b",
     r"\b7(?:07|17|27|37|47|57|67|77|87)[A-Z0-9]*\b",
     r"\b737\s?MAX\b",
     r"\b(?:DC|MD)\s?(?:8|9|10|11|8[0-9]|9[0-9])\b",
@@ -97,6 +97,8 @@ AIRLINER_PATTERNS = (
 
 BUSINESS_AIRLINER_DERIVATIVE_PATTERNS = (
     r"\bBBJ[0-9]*\b",
+    # Variant suffixes written onto the model number: "A319-133ACJ", "737-7BCBBJ".
+    r"(?<=[0-9])(?:ACJ|BBJ)[0-9]*\b",
     r"\bBOEING\s?BUSINESS\s?JET\b",
     r"\bACJ(?:\s?[0-9]{3}[A-Z0-9]*)?\b",
     r"\bAIRBUS\s?CORPORATE\s?JET\b",
@@ -225,6 +227,8 @@ class AircraftRecord:
     owner_country: str | None = None
     owner_type: str | None = None
     year_mfr: int | None = None
+    # Name of the ICAO type designator, e.g. "CESSNA 700 Citation Longitude".
+    type_name: str | None = None
 
 
 def clean(value: object) -> str | None:
@@ -317,6 +321,11 @@ def classify_aircraft(
     short_type: str | None = None,
     military: bool = False,
 ) -> str:
+    # A corporate variant may be written as a parenthetical: "737-7BC(BBJ)".
+    if matches_any(classifier_text(manufacturer, model), BUSINESS_AIRLINER_DERIVATIVE_PATTERNS) and not (
+        military or type_aircraft_code == "6" or matches_any(classifier_text(manufacturer, model), MILITARY_PATTERNS)
+    ):
+        return "business_jet"
     # Some registers append the manufacturer to the model: "172M (Cessna)".
     model = re.sub(r"\s*\([^()]*\)\s*$", "", model) if model else model
     text = classifier_text(manufacturer, model, icao_type)
@@ -428,18 +437,35 @@ def merge_record(records: dict[int, AircraftRecord], incoming: AircraftRecord) -
     refresh_record_classification(record)
 
 
+UNRESOLVED_CLASSES = {"unknown", "unknown_jet", "fixed_wing"}
+
+
 def refresh_record_classification(record: AircraftRecord) -> None:
-    record.aircraft_type = classify_aircraft(
-        manufacturer=record.manufacturer,
-        model=record.model,
-        type_aircraft_code=record.type_aircraft_code,
-        type_engine_code=record.type_engine_code,
-        seat_count=record.seat_count,
-        weight_class=record.weight_class,
-        icao_type=record.icao_type,
-        short_type=record.short_type,
-        military=record.military,
-    )
+    def classify(manufacturer: str | None, model: str | None) -> str:
+        return classify_aircraft(
+            manufacturer=manufacturer,
+            model=model,
+            type_aircraft_code=record.type_aircraft_code,
+            type_engine_code=record.type_engine_code,
+            seat_count=record.seat_count,
+            weight_class=record.weight_class,
+            icao_type=record.icao_type,
+            short_type=record.short_type,
+            military=record.military,
+        )
+
+    # Type names are only a fallback for fixed-wing text. A rotorcraft descriptor
+    # already classifies, and names such as "UH-60 Black Hawk" read as jet trainers.
+    type_name = None if (record.short_type or "")[:1].upper() in {"H", "G"} else record.type_name
+    if type_name and not record.manufacturer and not record.model:
+        # A bare designator is ambiguous text ("B350" reads like a Boeing code).
+        record.aircraft_type = classify(None, type_name)
+        return
+    record.aircraft_type = classify(record.manufacturer, record.model)
+    if type_name and record.aircraft_type in UNRESOLVED_CLASSES:
+        named = classify(None, type_name)
+        if named not in UNRESOLVED_CLASSES:
+            record.aircraft_type = named
 
 
 def load_faa_records(zip_path: Path, records: dict[int, AircraftRecord]) -> int:
@@ -574,24 +600,50 @@ def load_opensky_records(path: Path, records: dict[int, AircraftRecord]) -> int:
     return count
 
 
-def fill_airframes(path: Path, records: dict[int, AircraftRecord]) -> int:
-    """Derive missing airframe descriptors (e.g. L2J) from the ICAO type designator table.
-
-    Registry rows sometimes carry a type designator without a descriptor, and an
-    upstream refresh can drop a descriptor that an older snapshot had.
-    """
+def load_designators(path: Path) -> dict[str, list]:
     if not path.exists():
-        return 0
+        return {}
     raw = path.read_bytes()
     # tar1090-db serves this file gzip-compressed despite its .js name.
-    designators = json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw)
-    filled = 0
+    return json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw)
+
+
+def designator_airframe(registry: str | None, table: str | None) -> str | None:
+    """Choose the airframe descriptor (e.g. L2J) for a record with a known ICAO type.
+
+    The designator table describes the type itself; a registry descriptor that
+    disagrees with it is usually left over from an earlier aircraft on a reused
+    registration (a King Air 350 carrying a Grob trainer's L1P). The registry
+    is kept only where it adds a float or amphibian gear to the same engines.
+    """
+    table = (table or "").upper()
+    if not re.fullmatch(r"[A-Z][1-8][PTJE]", table):
+        return registry or table or None
+    registry_upper = (registry or "").strip().upper()
+    if registry_upper[1:] == table[1:] and registry_upper[:1] in {"A", "S"} and table[0] == "L":
+        return registry_upper
+    return table
+
+
+def fill_airframes(path: Path, records: dict[int, AircraftRecord]) -> dict[str, int]:
+    """Take airframe descriptors and type names from the ICAO type designator table."""
+    designators = load_designators(path)
+    filled = corrected = 0
     for record in records.values():
-        entry = designators.get(record.icao_type) if record.icao_type and not record.short_type else None
-        if entry and len(entry) > 1 and entry[1]:
-            record.short_type = entry[1]
-            filled += 1
-    return filled
+        entry = designators.get(record.icao_type) if record.icao_type else None
+        if not entry:
+            continue
+        if entry[0]:
+            record.type_name = clean(entry[0])
+        descriptor = designator_airframe(record.short_type, entry[1] if len(entry) > 1 else None)
+        if descriptor != record.short_type:
+            if record.short_type:
+                corrected += 1
+            else:
+                filled += 1
+            record.short_type = descriptor
+        refresh_record_classification(record)
+    return {"airframes_from_type": filled, "airframes_corrected_from_type": corrected}
 
 
 def write_airframe_index(connection: sqlite3.Connection) -> None:
@@ -685,7 +737,7 @@ def import_aircraft(
         "tar1090_rows": load_tar1090_records(tar1090_path, records),
         "opensky_rows": load_opensky_records(opensky_path, records),
     }
-    details["airframes_from_type"] = fill_airframes(types_path, records)
+    details.update(fill_airframes(types_path, records))
     result = write_aircraft_db(db_path, records, details)
     result["owner_sources"] = import_owners(db_path, adsbx_path, opensky_path)
     return result

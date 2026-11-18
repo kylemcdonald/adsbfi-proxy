@@ -3,7 +3,9 @@ import tempfile
 import sqlite3
 import struct
 from pathlib import Path
-from adsbfi_proxy.aircraft import classify_aircraft, AircraftRecord, write_aircraft_db
+import gzip
+import json
+from adsbfi_proxy.aircraft import classify_aircraft, AircraftRecord, write_aircraft_db, fill_airframes, designator_airframe, refresh_record_classification
 
 class AircraftClassificationTests(unittest.TestCase):
     def test_physical_airframe_survives_military_classification(self):
@@ -65,3 +67,55 @@ class AircraftClassificationTests(unittest.TestCase):
         self.assertEqual(classify_aircraft(icao_type='C337', short_type='L2P'), 'piston')
         self.assertEqual(classify_aircraft(icao_type='B350', short_type='L2T'), 'turboprop')
         self.assertEqual(classify_aircraft(manufacturer='PIPER', model='PA 46-350P', icao_type='P46T', short_type='L1T', type_engine_code='1'), 'turboprop')
+
+    def test_corporate_suffixes_are_business_jets(self):
+        # kylemcdonald/adsbfi-proxy#4
+        for manufacturer, model, icao in [
+            ('BOEING', '737-7BC(BBJ)', 'B737'),
+            ('BOEING', '737-8ZE(BBJ2)', 'B738'),
+            ('AIRBUS', 'A319-133ACJ', 'A319'),
+            ('AIRBUS', 'A350-941ACJ', 'A359'),
+        ]:
+            with self.subTest(model=model):
+                self.assertEqual(classify_aircraft(manufacturer=manufacturer, model=model, icao_type=icao), 'business_jet')
+        self.assertEqual(classify_aircraft(manufacturer='BOEING', model='737-7H4', icao_type='B737'), 'commercial_jet')
+        self.assertEqual(classify_aircraft(icao_type='B38M'), 'commercial_jet')
+        self.assertNotEqual(classify_aircraft(model='B300'), 'commercial_jet')  # King Air model code, not a Boeing designator
+        self.assertEqual(classify_aircraft(manufacturer='Cessna Aircraft Company', model='172M (Cessna)'), 'piston')
+
+    def test_type_table_descriptor_replaces_stale_registry_descriptor(self):
+        # kylemcdonald/adsbfi-proxy#2: reused registrations keep the old aircraft's descriptor.
+        self.assertEqual(designator_airframe('L1P', 'L2T'), 'L2T')
+        self.assertEqual(designator_airframe('H2T', 'L2T'), 'L2T')
+        self.assertEqual(designator_airframe('A1T', 'L1T'), 'A1T')  # amphibious Caravan keeps its floats
+        self.assertEqual(designator_airframe('L1P', 'L0-'), 'L1P')  # uninformative table entry
+        self.assertEqual(designator_airframe(None, 'L2J'), 'L2J')
+        self.assertEqual(designator_airframe(None, 'L0-'), 'L0-')
+        table = {
+            'B350': ['BEECHCRAFT Super King Air 350', 'L2T', 'M'],
+            'BE20': ['BEECH 200 Super King Air', 'L2T', 'M'],
+            'C700': ['CESSNA 700 Citation Longitude', 'L2J', 'M'],
+            'H25B': ['HAWKER BEECHCRAFT Hawker 750/850', 'L2J', 'M'],
+            'BE30': ['BEECH 300 Super King Air', 'L2T', 'L'],
+        }
+        records = {
+            1: AircraftRecord(1, manufacturer='BEECHCRAFT', model='Super King Air 350', icao_type='B350', short_type='L1P'),
+            2: AircraftRecord(2, manufacturer='BEECH', model='Super King Air 200', icao_type='BE20', short_type='H2T'),
+            3: AircraftRecord(3, icao_type='C700'),
+            4: AircraftRecord(4, icao_type='H25B', short_type='L2J'),
+            5: AircraftRecord(5, model='B300', icao_type='BE30'),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'types.js'
+            path.write_bytes(gzip.compress(json.dumps(table).encode()))
+            counts = fill_airframes(path, records)
+        self.assertEqual(counts, {'airframes_from_type': 2, 'airframes_corrected_from_type': 2})
+        self.assertEqual([records[i].short_type for i in range(1, 6)], ['L2T', 'L2T', 'L2J', 'L2J', 'L2T'])
+        for record in records.values():
+            refresh_record_classification(record)
+        rotor = AircraftRecord(6, icao_type='H60', short_type='H2T', type_name='SIKORSKY UH-60 Black Hawk')
+        refresh_record_classification(rotor)
+        self.assertEqual(rotor.aircraft_type, 'helicopter')
+        # kylemcdonald/adsbfi-proxy#5: no manufacturer, classified from the type name.
+        self.assertEqual([records[i].aircraft_type for i in range(1, 6)],
+                         ['turboprop', 'turboprop', 'business_jet', 'business_jet', 'turboprop'])
