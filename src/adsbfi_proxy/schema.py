@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS airports (
 );
 
 CREATE INDEX IF NOT EXISTS idx_airports_lat_lon ON airports(lat_e7, lon_e7);
+
+-- Runway centrelines, used to measure how close a report is to a land airport.
+CREATE TABLE IF NOT EXISTS runways (
+    airport_id INTEGER NOT NULL,
+    le_lat_e7 INTEGER NOT NULL,
+    le_lon_e7 INTEGER NOT NULL,
+    he_lat_e7 INTEGER NOT NULL,
+    he_lon_e7 INTEGER NOT NULL,
+    surface TEXT,
+    FOREIGN KEY (airport_id) REFERENCES airports(airport_id)
+);
+CREATE INDEX IF NOT EXISTS idx_runways_airport ON runways(airport_id);
 CREATE INDEX IF NOT EXISTS idx_airports_type_lat_lon ON airports(airport_type_id, lat_e7, lon_e7);
 """
 

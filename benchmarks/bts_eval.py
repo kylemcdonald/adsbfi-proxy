@@ -111,27 +111,39 @@ def icao_for_registration(registration: str) -> int | None:
 US_COUNTRIES = {"US", "PR", "VI", "GU", "AS", "MP"}
 
 
-def load_domestic_ids(ourairports_csv: Path, airports_db: Path) -> set[int]:
+def ourairports_rows(ourairports_csv: Path, airports_db: Path):
+    """OurAirports rows with the ledger's airport_id, for databases keyed either way.
+
+    Older airports databases use the OurAirports ident as the code; newer ones
+    replace placeholder idents with a real code (see adsbfi_proxy.airports).
+    """
+    from adsbfi_proxy.airports import airport_codes
+
     db = sqlite3.connect(f"file:{airports_db}?mode=ro", uri=True)
     ids = dict(db.execute("SELECT code, airport_id FROM airports"))
     with ourairports_csv.open(newline="", encoding="utf-8") as handle:
-        return {ids[r["ident"]] for r in csv.DictReader(handle) if r["iso_country"] in US_COUNTRIES and r["ident"] in ids}
+        rows = list(csv.DictReader(handle))
+    for row, code in zip(rows, airport_codes(rows)):
+        airport_id = ids.get(row["ident"], ids.get(code))
+        if airport_id is not None:
+            yield row, airport_id
+
+
+def load_domestic_ids(ourairports_csv: Path, airports_db: Path) -> set[int]:
+    return {airport_id for r, airport_id in ourairports_rows(ourairports_csv, airports_db) if r["iso_country"] in US_COUNTRIES}
 
 
 def load_iata_map(ourairports_csv: Path, airports_db: Path):
     """IATA code -> (airport_id, lat, lon) using OurAirports idents."""
-    db = sqlite3.connect(f"file:{airports_db}?mode=ro", uri=True)
-    ids = dict(db.execute("SELECT code, airport_id FROM airports"))
     rank = {"large_airport": 0, "medium_airport": 1, "small_airport": 2}
     best = {}
-    with ourairports_csv.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            code = row["iata_code"].strip()
-            if not code or row["ident"] not in ids:
-                continue
-            key = (rank.get(row["type"], 3), row["iso_country"] != "US")
-            if code not in best or key < best[code][0]:
-                best[code] = (key, ids[row["ident"]], float(row["latitude_deg"]), float(row["longitude_deg"]), row["ident"])
+    for row, airport_id in ourairports_rows(ourairports_csv, airports_db):
+        code = row["iata_code"].strip()
+        if not code:
+            continue
+        key = (rank.get(row["type"], 3), row["iso_country"] != "US")
+        if code not in best or key < best[code][0]:
+            best[code] = (key, airport_id, float(row["latitude_deg"]), float(row["longitude_deg"]), row["ident"])
     return {code: value[1:] for code, value in best.items()}
 
 

@@ -28,6 +28,7 @@ STATE_DB = DB_DIR / "build_state.sqlite"
 
 REFERENCE_DIR = DB_DIR / "reference"
 AIRPORTS_CSV = REFERENCE_DIR / "ourairports-airports.csv"
+RUNWAYS_CSV = REFERENCE_DIR / "ourairports-runways.csv"
 ADSBX_BASIC_AIRCRAFT_DB = AIRCRAFT_CACHE_DIR / "basic-ac-db.json.gz"
 TAR1090_AIRCRAFT_DB = AIRCRAFT_CACHE_DIR / "tar1090-aircraft.csv.gz"
 TAR1090_TYPES_DB = AIRCRAFT_CACHE_DIR / "icao_aircraft_types2.js"
